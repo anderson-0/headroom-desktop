@@ -15,6 +15,7 @@ mod pricing;
 mod proxy_intercept;
 mod state;
 mod storage;
+mod token_reduction;
 mod tool_manager;
 
 use std::future::Future;
@@ -3403,6 +3404,10 @@ pub fn run() {
         .manage(state)
         .manage(PendingAppUpdate(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
+            token_reduction::get_token_reduction_config,
+            token_reduction::set_token_reduction_config,
+            token_reduction::get_token_reduction_capabilities,
+            token_reduction::get_cache_stats,
             get_dashboard_state,
             get_app_update_configuration,
             check_for_app_update,

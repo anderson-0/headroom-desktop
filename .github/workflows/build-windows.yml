@@ -1,0 +1,73 @@
+name: Build Windows App
+
+# Stage 1/5 of the Windows port (issue #38). This is a *validation* build, not a
+# publisher: it compiles the crate and runs the lib tests on a real
+# windows-latest (MSVC) runner so the Windows-only code paths (keychain
+# Credential Manager backend, cfg audit) are actually checked. Publishing,
+# code signing, and updater artifacts are deliberately out of scope until the
+# signing decision is made -- see docs/windows-port-plan.md Stage 5.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle:
+        description: "Also build the NSIS installer (no signing/publish)"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - src-tauri/**
+      - package.json
+      - package-lock.json
+      - .github/workflows/build-windows.yml
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: cargo test (lib)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build NSIS installer (unsigned)
+        if: inputs.bundle
+        shell: bash
+        run: npm run tauri build -- --bundles nsis --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Upload installer
+        if: inputs.bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: headroom-windows-nsis
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error

@@ -257,7 +257,7 @@ function TimeChip({ iso }: { iso: string | null | undefined }) {
   );
 }
 
-function workspaceBasename(path: string | null | undefined): string | null {
+export function workspaceBasename(path: string | null | undefined): string | null {
   if (!path) return null;
   const segments = path.split("/").filter(Boolean);
   return segments.length > 0 ? segments[segments.length - 1] : null;
@@ -383,6 +383,107 @@ export function collapseDiff(diff: DiffLine[], context = DIFF_CONTEXT): Collapse
   return out;
 }
 
+// Distribute an exact aggregate token total across messages proportional to each
+// message's text length, so the per-message numbers sum back to the exact total.
+// The proxy reports only the request-level total (no per-message tokens) and the
+// desktop has no tokenizer, so this is the closest honest attribution without a
+// backend change. Falls back to a chars/4 estimate when the aggregate is unknown.
+export function estimatePerMessageTokens(
+  messages: TransformationRequestMessage[],
+  aggregateTokens: number | null | undefined
+): number[] {
+  const chars = messages.map((m) => messageText(m).length);
+  const total = chars.reduce((a, b) => a + b, 0);
+  if (aggregateTokens != null && total > 0) {
+    return chars.map((c) => Math.round((aggregateTokens * c) / total));
+  }
+  return chars.map((c) => Math.round(c / 4));
+}
+
+// Per-message token estimate table: original -> compacted tokens and the delta
+// for each message, paired by index (the proxy guarantees the original and
+// compressed lists are the same length and aligned). Numbers are estimates
+// (see estimatePerMessageTokens); the column is labelled accordingly.
+function PerMessageTokens({
+  requestMessages,
+  compressedMessages,
+  inputTokensOriginal,
+  inputTokensOptimized
+}: {
+  requestMessages: TransformationRequestMessage[];
+  compressedMessages: TransformationRequestMessage[];
+  inputTokensOriginal?: number | null;
+  inputTokensOptimized?: number | null;
+}) {
+  const [showUnchanged, setShowUnchanged] = useState(false);
+  const n = Math.min(requestMessages.length, compressedMessages.length);
+  if (n === 0) return null;
+  const origTok = estimatePerMessageTokens(requestMessages, inputTokensOriginal);
+  const compTok = estimatePerMessageTokens(compressedMessages, inputTokensOptimized);
+  const rows: { i: number; role: string; before: number; after: number; delta: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    const changed =
+      messageText(requestMessages[i]) !== messageText(compressedMessages[i]);
+    // ponytail: hide unchanged messages by default so long requests stay scannable
+    if (!changed && !showUnchanged) continue;
+    const before = origTok[i];
+    const after = compTok[i];
+    const delta = before > 0 ? Math.round(((after - before) / before) * 100) : 0;
+    const role = (requestMessages[i].role ?? "").trim() || "(unknown)";
+    rows.push({ i, role, before, after, delta });
+  }
+  const hidden = n - rows.length;
+  return (
+    <>
+      <dt>Per-message tokens (est.)</dt>
+      <dd>
+        <table className="activity-feed__msg-tokens">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Role</th>
+              <th>Original</th>
+              <th>Compacted</th>
+              <th>Δ</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.i}>
+                <td>{r.i + 1}</td>
+                <td>{r.role}</td>
+                <td>{r.before.toLocaleString()}</td>
+                <td>{r.after.toLocaleString()}</td>
+                <td
+                  className={
+                    r.delta < 0
+                      ? "activity-feed__msg-tokens-delta--cut"
+                      : r.delta > 0
+                        ? "activity-feed__msg-tokens-delta--grew"
+                        : undefined
+                  }
+                >
+                  {r.delta > 0 ? "+" : ""}
+                  {r.delta}%
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {hidden > 0 || showUnchanged ? (
+          <button
+            type="button"
+            className="activity-feed__msg-tokens-toggle"
+            onClick={() => setShowUnchanged((v) => !v)}
+          >
+            {showUnchanged ? "Hide unchanged messages" : `Show ${hidden} unchanged`}
+          </button>
+        ) : null}
+      </dd>
+    </>
+  );
+}
+
 // Unified line diff of original vs compressed request bodies, so pruned content
 // (red) and inserted truncation markers (green) pop instead of two near-identical
 // dumps. Returns dt/dd fragment for the detail grid. Shared by the transformation
@@ -447,7 +548,7 @@ function CompressionDiff({
   );
 }
 
-function TransformationRow({ event }: { event: TransformationFeedEvent }) {
+export function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const saved = event.tokensSaved ?? 0;
   const pct = event.savingsPercent ?? 0;
   const workspace = workspaceBasename(event.workspace);
@@ -515,12 +616,20 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
         </>
       ) : null}
       {hasRequestMessages && hasCompressedMessages ? (
-        <CompressionDiff
-          requestMessages={event.requestMessages!}
-          compressedMessages={event.compressedMessages!}
-          inputTokensOriginal={event.inputTokensOriginal}
-          inputTokensOptimized={event.inputTokensOptimized}
-        />
+        <>
+          <PerMessageTokens
+            requestMessages={event.requestMessages!}
+            compressedMessages={event.compressedMessages!}
+            inputTokensOriginal={event.inputTokensOriginal}
+            inputTokensOptimized={event.inputTokensOptimized}
+          />
+          <CompressionDiff
+            requestMessages={event.requestMessages!}
+            compressedMessages={event.compressedMessages!}
+            inputTokensOriginal={event.inputTokensOriginal}
+            inputTokensOptimized={event.inputTokensOptimized}
+          />
+        </>
       ) : hasRequestMessages ? (
         // Legacy proxy shape: only `requestMessages` exists. Its content may
         // actually be the post-compression list (field was inconsistent
@@ -848,12 +957,20 @@ function RecordRow({ event }: { event: RecordEvent }) {
         </>
       ) : null}
       {hasRequestMessages && hasCompressedMessages ? (
-        <CompressionDiff
-          requestMessages={event.requestMessages!}
-          compressedMessages={event.compressedMessages!}
-          inputTokensOriginal={event.inputTokensOriginal}
-          inputTokensOptimized={event.inputTokensOptimized}
-        />
+        <>
+          <PerMessageTokens
+            requestMessages={event.requestMessages!}
+            compressedMessages={event.compressedMessages!}
+            inputTokensOriginal={event.inputTokensOriginal}
+            inputTokensOptimized={event.inputTokensOptimized}
+          />
+          <CompressionDiff
+            requestMessages={event.requestMessages!}
+            compressedMessages={event.compressedMessages!}
+            inputTokensOriginal={event.inputTokensOriginal}
+            inputTokensOptimized={event.inputTokensOptimized}
+          />
+        </>
       ) : hasRequestMessages ? (
         <>
           <dt>Request</dt>

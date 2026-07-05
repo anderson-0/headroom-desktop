@@ -273,9 +273,42 @@ mod platform {
     }
 }
 
-// ── Release / non-macOS: stub ─────────────────────────────────────────────────
+// ── Release / Windows: Credential Manager ─────────────────────────────────────
 
-#[cfg(all(not(debug_assertions), not(target_os = "macos")))]
+#[cfg(all(not(debug_assertions), windows))]
+mod platform {
+    use keyring::Entry;
+
+    fn entry(service: &str, account: &str) -> Result<Entry, String> {
+        Entry::new(service, account)
+            .map_err(|err| format!("Credential Manager entry {service}/{account}: {err}"))
+    }
+
+    pub fn read_secret(service: &str, account: &str) -> Result<Option<String>, String> {
+        match entry(service, account)?.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(format!("read Credential Manager secret: {err}")),
+        }
+    }
+
+    pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
+        entry(service, account)?
+            .set_password(secret)
+            .map_err(|err| format!("write Credential Manager secret: {err}"))
+    }
+
+    pub fn delete_secret(service: &str, account: &str) -> Result<(), String> {
+        match entry(service, account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(format!("delete Credential Manager secret: {err}")),
+        }
+    }
+}
+
+// ── Release / other non-macOS (e.g. Linux): stub ──────────────────────────────
+
+#[cfg(all(not(debug_assertions), not(target_os = "macos"), not(windows)))]
 mod platform {
     pub fn read_secret(_service: &str, _account: &str) -> Result<Option<String>, String> {
         Ok(None)
