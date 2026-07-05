@@ -4,6 +4,7 @@ import {
   ActivityFeed,
   collapseDiff,
   diffLines,
+  estimatePerMessageTokens,
   formatRequestMessages,
   groupTransforms
 } from "./ActivityFeed";
@@ -911,5 +912,28 @@ describe("collapseDiff", () => {
     // Context lines immediately around the change are preserved.
     expect(collapsed.some((l) => l.type === "same" && l.text === "999")).toBe(true);
     expect(collapsed.some((l) => l.type === "same" && l.text === "1001")).toBe(true);
+  });
+});
+
+describe("estimatePerMessageTokens", () => {
+  const msg = (text: string) => ({ role: "user", content: text });
+
+  it("distributes the exact aggregate so per-message tokens sum back to it", () => {
+    const messages = [msg("a".repeat(30)), msg("b".repeat(70))];
+    const per = estimatePerMessageTokens(messages, 1000);
+    expect(per.reduce((a, b) => a + b, 0)).toBe(1000);
+    // Proportional to text length (30 / 70 chars).
+    expect(per[0]).toBe(300);
+    expect(per[1]).toBe(700);
+  });
+
+  it("falls back to chars/4 when the aggregate is absent", () => {
+    const per = estimatePerMessageTokens([msg("x".repeat(40))], null);
+    expect(per[0]).toBe(10);
+  });
+
+  it("returns zeros without dividing by zero for empty text", () => {
+    const per = estimatePerMessageTokens([msg(""), msg("")], 500);
+    expect(per).toEqual([0, 0]);
   });
 });

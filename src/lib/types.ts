@@ -317,6 +317,12 @@ export interface TransformationFeedEvent {
   compressedMessages?: TransformationRequestMessage[] | null;
 }
 
+export interface CacheStats {
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  uncachedInputTokens: number;
+}
+
 export interface TransformationFeedResponse {
   logFullMessages: boolean;
   proxyReachable: boolean;

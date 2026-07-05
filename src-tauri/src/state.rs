@@ -4738,6 +4738,58 @@ fn fetch_headroom_dashboard_stats() -> Option<HeadroomDashboardStats> {
     None
 }
 
+/// Prefix-cache token totals from the proxy `/stats` (`prefix_cache.totals`).
+/// Surfaced for the Token Reduction cache panel. `cache_read` = tokens served from
+/// the provider prefix cache (cheap), `cache_write` = genuinely-new tokens written
+/// to cache (premium), `uncached` = input that did not cache.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheStats {
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub uncached_input_tokens: u64,
+}
+
+pub fn parse_cache_stats_from_json(body: &str) -> Option<CacheStats> {
+    let root: serde_json::Value = serde_json::from_str(body).ok()?;
+    let read = value_at_path_u64(&root, &["prefix_cache", "totals", "cache_read_tokens"]);
+    let write = value_at_path_u64(&root, &["prefix_cache", "totals", "cache_write_tokens"]);
+    let uncached = value_at_path_u64(&root, &["prefix_cache", "totals", "uncached_input_tokens"]);
+    match (read, write, uncached) {
+        (None, None, None) => None,
+        _ => Some(CacheStats {
+            cache_read_tokens: read.unwrap_or(0),
+            cache_write_tokens: write.unwrap_or(0),
+            uncached_input_tokens: uncached.unwrap_or(0),
+        }),
+    }
+}
+
+pub fn fetch_cache_stats() -> Option<CacheStats> {
+    if !is_headroom_proxy_reachable() {
+        return None;
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()
+        .ok()?;
+    for host in ["127.0.0.1", "localhost"] {
+        let url = format!("http://{host}:6767/stats");
+        let response = match client.get(&url).send() {
+            Ok(response) if response.status().is_success() => response,
+            _ => continue,
+        };
+        let body = match response.text() {
+            Ok(body) => body,
+            Err(_) => continue,
+        };
+        if let Some(stats) = parse_cache_stats_from_json(&body) {
+            return Some(stats);
+        }
+    }
+    None
+}
+
 fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
     if !is_headroom_proxy_reachable() {
         return None;
@@ -5920,10 +5972,11 @@ mod tests {
         boot_validation_stalled, bootstrap_complete_state, bootstrap_failed_state,
         classify_startup_error, cpu_time_advanced, hf_cache_grew,
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
-        merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
-        proxy_readyz_status_is_reachable, rebuild_persisted_savings_from_records,
-        tcp_port_accepts_connection, total_dir_size_bytes, AppState, BootValidationOutcome,
+        merge_hourly_savings, most_recent_monday, parse_cache_stats_from_json,
+        parse_headroom_stats_from_json, parse_headroom_stats_history_from_json,
+        parse_ps_cpu_time, proxy_readyz_status_is_reachable,
+        rebuild_persisted_savings_from_records, tcp_port_accepts_connection,
+        total_dir_size_bytes, AppState, BootValidationOutcome,
         ClaudeProjectScan, DailySavingsBucket, HeadroomDashboardStats, HeadroomSavingsHistoryPoint,
         PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
     };
@@ -7443,6 +7496,20 @@ mod tests {
         assert_eq!(scan.session_files.len(), 1);
 
         fs::remove_dir_all(&test_dir).expect("remove temp dir");
+    }
+
+    #[test]
+    fn parse_cache_stats_extracts_prefix_cache_totals() {
+        let body = r#"{"prefix_cache":{"totals":{"cache_read_tokens":92000,"cache_write_tokens":7000,"uncached_input_tokens":1000}}}"#;
+        let parsed = parse_cache_stats_from_json(body).expect("cache stats");
+        assert_eq!(parsed.cache_read_tokens, 92000);
+        assert_eq!(parsed.cache_write_tokens, 7000);
+        assert_eq!(parsed.uncached_input_tokens, 1000);
+    }
+
+    #[test]
+    fn parse_cache_stats_returns_none_without_prefix_cache() {
+        assert!(parse_cache_stats_from_json(r#"{"other":1}"#).is_none());
     }
 
     #[test]

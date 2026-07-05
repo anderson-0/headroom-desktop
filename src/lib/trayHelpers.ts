@@ -9,6 +9,7 @@ export type TrayView =
   | "health"
   | "notifications"
   | "addons"
+  | "tokenReduction"
   | "upgrade"
   | "upgradeAuth"
   | "settings";

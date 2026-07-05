@@ -17,6 +17,7 @@ import {
   Cpu,
   CurrencyCircleDollar,
   CurrencyDollar,
+  Gauge,
   Info,
   EnvelopeSimple,
   GearSix,
@@ -141,6 +142,8 @@ import {
 } from "./lib/trayHelpers";
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { ActivityFeed } from "./components/ActivityFeed";
+import { CompactionHistory } from "./components/CompactionHistory";
+import { TokenReductionView } from "./components/TokenReduction";
 import { LauncherShell } from "./components/LauncherShell";
 import { OptimizePanel } from "./components/OptimizePanel";
 import { TermsGate } from "./components/TermsGate";
@@ -178,6 +181,7 @@ const navItems: NavItem[] = [
   { id: "home", label: "Home", icon: House },
   { id: "optimization", label: "Optimize", icon: Sliders },
   { id: "notifications", label: "Activity", icon: Bell },
+  { id: "tokenReduction", label: "Savings", icon: Gauge },
   { id: "addons", label: "Addons", icon: PuzzlePiece },
 ];
 
@@ -5215,6 +5219,11 @@ export default function App() {
             loaded={activityFeedLoaded}
             onNavigateToOptimize={() => setActiveView("optimization")}
           />
+          <CompactionHistory />
+        </div>
+
+        <div className="tray-content" hidden={activeView !== "tokenReduction"}>
+          <TokenReductionView />
         </div>
 
         <div className="tray-content" hidden={activeView !== "addons"}>
