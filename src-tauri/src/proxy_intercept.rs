@@ -148,7 +148,10 @@ pub fn spawn(
     codex_bypass: BypassFlag,
     fresh_bearer_tx: FreshBearerNotifier,
 ) {
-    let upstream_base = Arc::new(ANTHROPIC_DIRECT_BASE.to_string());
+    // pxpipe imaging (plan 06): the direct/bypass path forwards through the
+    // pxpipe sidecar when imaging is enabled and the sidecar is healthy, else
+    // straight to Anthropic. Resolved once at intercept spawn.
+    let upstream_base = Arc::new(crate::pxpipe::resolve_direct_upstream(ANTHROPIC_DIRECT_BASE));
     std::thread::Builder::new()
         .name("proxy-intercept".into())
         .spawn(move || {

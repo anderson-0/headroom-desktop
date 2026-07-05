@@ -132,6 +132,61 @@ pub fn stop(state: &PxpipeState) {
     }
 }
 
+/// Phase 2 gate for the upstream flip. Phase 3 wires this to
+/// token-reduction-config.json (`imaging.enabled`); for now an env var drives it
+/// so the flip can be verified without the config/UI.
+// ponytail: env flag now, config key in phase 3.
+pub fn imaging_enabled() -> bool {
+    matches!(
+        std::env::var("HEADROOM_PXPIPE_IMAGING").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+fn sidecar_upstream_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Env for the headroom backend so it forwards to the pxpipe sidecar instead of
+/// Anthropic (headroom reads `ANTHROPIC_TARGET_API_URL`). Pxpipe then forwards to
+/// the real Anthropic — putting pxpipe last, closest to the model.
+///
+/// Returns empty unless imaging is on AND the sidecar is healthy: never point
+/// headroom at a dead port, or all traffic breaks. When empty, headroom keeps its
+/// built-in upstream and imaging is silently a no-op.
+fn backend_upstream_env_for(
+    enabled: bool,
+    healthy: bool,
+    port: u16,
+) -> Vec<(&'static str, String)> {
+    if enabled && healthy {
+        vec![("ANTHROPIC_TARGET_API_URL", sidecar_upstream_url(port))]
+    } else {
+        Vec::new()
+    }
+}
+
+pub fn backend_upstream_env() -> Vec<(&'static str, String)> {
+    let port = pxpipe_port::get();
+    backend_upstream_env_for(imaging_enabled(), sidecar_healthy(port), port)
+}
+
+/// Direct/bypass-path upstream for the Rust intercept: pxpipe when imaging is on
+/// and healthy, else the passed-through Anthropic base. Same safety rule as
+/// [`backend_upstream_env`].
+fn resolve_direct_upstream_for(enabled: bool, healthy: bool, port: u16, fallback: &str) -> String {
+    if enabled && healthy {
+        sidecar_upstream_url(port)
+    } else {
+        fallback.to_string()
+    }
+}
+
+pub fn resolve_direct_upstream(fallback: &str) -> String {
+    let port = pxpipe_port::get();
+    resolve_direct_upstream_for(imaging_enabled(), sidecar_healthy(port), port, fallback)
+}
+
 #[tauri::command]
 pub fn pxpipe_start(state: State<'_, PxpipeState>) -> Result<u16, String> {
     start(&state)
@@ -189,6 +244,38 @@ mod tests {
         assert_eq!(
             locate_executable("npx", "/usr/bin:/bin", |_| false),
             None
+        );
+    }
+
+    #[test]
+    fn backend_upstream_env_injects_only_when_enabled_and_healthy() {
+        assert_eq!(
+            backend_upstream_env_for(true, true, 47821),
+            vec![(
+                "ANTHROPIC_TARGET_API_URL",
+                "http://127.0.0.1:47821".to_string()
+            )]
+        );
+        // Enabled but sidecar down: no injection (don't brick traffic).
+        assert!(backend_upstream_env_for(true, false, 47821).is_empty());
+        // Disabled: no injection regardless of health.
+        assert!(backend_upstream_env_for(false, true, 47821).is_empty());
+    }
+
+    #[test]
+    fn resolve_direct_upstream_flips_only_when_enabled_and_healthy() {
+        let anthropic = "https://api.anthropic.com";
+        assert_eq!(
+            resolve_direct_upstream_for(true, true, 47821, anthropic),
+            "http://127.0.0.1:47821"
+        );
+        assert_eq!(
+            resolve_direct_upstream_for(true, false, 47821, anthropic),
+            anthropic
+        );
+        assert_eq!(
+            resolve_direct_upstream_for(false, true, 47821, anthropic),
+            anthropic
         );
     }
 

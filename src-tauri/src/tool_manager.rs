@@ -919,6 +919,12 @@ impl ToolManager {
                     // off by default). Desktop opts in on the user's behalf.
                     .env("HEADROOM_TELEMETRY", "on")
                     .env("HEADROOM_HTTP2", "false")
+                    // pxpipe imaging (plan 06): when enabled and the sidecar is
+                    // healthy, point headroom's upstream at the pxpipe sidecar
+                    // (ANTHROPIC_TARGET_API_URL) so pxpipe images the request last,
+                    // then forwards to Anthropic. Empty otherwise — headroom keeps
+                    // its built-in upstream.
+                    .envs(crate::pxpipe::backend_upstream_env())
                     // Disable the HTTP/1.1 keep-alive pool for the upstream
                     // (proxy -> api.anthropic.com) client. Claude Code cancels
                     // streaming requests constantly (ESC, aborted tool calls,
