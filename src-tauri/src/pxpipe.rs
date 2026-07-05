@@ -191,4 +191,41 @@ mod tests {
             None
         );
     }
+
+    // Manual smoke test of the real spawn/health/stop path. Needs Node (npx) on
+    // PATH and network (first-run npx fetch of pxpipe-proxy). Not run in CI.
+    //   cargo test --manifest-path src-tauri/Cargo.toml --lib \
+    //     pxpipe::tests::smoke_start_health_stop -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn smoke_start_health_stop() {
+        let state = PxpipeState::default();
+
+        let port = start(&state).expect("start sidecar");
+        assert_eq!(port, pxpipe_port::get());
+
+        // First run downloads the package; poll health generously.
+        let mut healthy = false;
+        for _ in 0..120 {
+            if sidecar_healthy(port) {
+                healthy = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        assert!(healthy, "sidecar never became healthy on port {port}");
+
+        stop(&state);
+
+        // Port should free up shortly after the group is killed.
+        let mut freed = false;
+        for _ in 0..20 {
+            if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                freed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(freed, "port {port} still held after stop");
+    }
 }
