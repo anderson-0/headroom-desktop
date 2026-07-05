@@ -12,7 +12,10 @@ export type Capability =
   | "pruning.stats.v1"
   | "ccr.browse.v1"
   | "ccr.config.v1"
-  | "token_stats.v1";
+  | "token_stats.v1"
+  // Desktop-managed engine (pxpipe imaging, plan 06), not proxy-provided: a local
+  // probe (Node present) reports it, not the proxy.
+  | "imaging.local.v1";
 
 // Desktop-written config the proxy is assumed to read. All optional — absent keys
 // mean "proxy default". Loosely typed on purpose; feature plans flesh out shapes.
@@ -41,5 +44,10 @@ export interface TokenReductionConfig {
     ttlSeconds?: number;
     maxStoreBytes?: number;
     evictionPolicy?: "lru" | "lrr" | "fifo";
+  };
+  // pxpipe imaging (plan 06). Desktop-managed sidecar, gated on `enabled`. Model /
+  // opus / min-size knobs land with the pxpipe-config derivation (phase 5).
+  imaging?: {
+    enabled?: boolean;
   };
 }

@@ -132,15 +132,21 @@ pub fn stop(state: &PxpipeState) {
     }
 }
 
-/// Phase 2 gate for the upstream flip. Phase 3 wires this to
-/// token-reduction-config.json (`imaging.enabled`); for now an env var drives it
-/// so the flip can be verified without the config/UI.
-// ponytail: env flag now, config key in phase 3.
+/// Gate for the upstream flip: the `imaging.enabled` key in
+/// token-reduction-config.json (plan 06 phase 3). The `HEADROOM_PXPIPE_IMAGING`
+/// env var forces it on for dev/testing without touching the config file.
 pub fn imaging_enabled() -> bool {
-    matches!(
-        std::env::var("HEADROOM_PXPIPE_IMAGING").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
+    crate::token_reduction::read_imaging_enabled()
+        || matches!(
+            std::env::var("HEADROOM_PXPIPE_IMAGING").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+}
+
+/// Whether the Node runtime (npx) is on PATH — the prerequisite for the pxpipe
+/// sidecar. Drives the `imaging.local.v1` capability.
+pub fn node_available() -> bool {
+    locate_npx().is_some()
 }
 
 fn sidecar_upstream_url(port: u16) -> String {

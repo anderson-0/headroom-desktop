@@ -51,13 +51,39 @@ pub fn get_cache_stats() -> Option<crate::state::CacheStats> {
     crate::state::fetch_cache_stats()
 }
 
-/// Which token-reduction capabilities the proxy reports.
-// ponytail: no proxy capability endpoint exists yet, so this returns empty and the
-// UI shows "requires proxy" gates. Wire to the real /token-stats capabilities probe
-// when it ships (see docs/plans/proxy-dependencies.md).
+/// Which token-reduction capabilities are available.
+//
+// Proxy-provided capabilities (cache/routing/pruning/ccr) have no probe endpoint
+// yet, so those stay absent and the UI shows "requires proxy" gates. `imaging` is
+// different: it's a desktop-managed engine (the pxpipe sidecar, plan 06), so its
+// availability is a *local* probe — is Node present? See docs/plans/06-pxpipe-imaging.md.
 #[tauri::command]
 pub fn get_token_reduction_capabilities() -> Vec<String> {
-    Vec::new()
+    local_capabilities(crate::pxpipe::node_available())
+}
+
+/// Pure core of the local capability probe, split out for testing.
+fn local_capabilities(node_available: bool) -> Vec<String> {
+    let mut caps = Vec::new();
+    if node_available {
+        caps.push("imaging.local.v1".to_string());
+    }
+    caps
+}
+
+/// Read `imaging.enabled` from the token-reduction config. The gate for the
+/// pxpipe upstream flip (plan 06 phase 3). Missing file / key ⇒ false.
+pub fn read_imaging_enabled() -> bool {
+    read_config_at(&config_path())
+        .map(|cfg| imaging_enabled_from_value(&cfg))
+        .unwrap_or(false)
+}
+
+fn imaging_enabled_from_value(cfg: &Value) -> bool {
+    cfg.get("imaging")
+        .and_then(|imaging| imaging.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -78,5 +104,36 @@ mod tests {
         write_config_at(&path, &cfg).unwrap();
         assert_eq!(read_config_at(&path).unwrap(), cfg);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn imaging_config_roundtrips() {
+        let path = std::env::temp_dir().join("hr-tr-imaging.json");
+        let cfg = serde_json::json!({ "imaging": { "enabled": true } });
+        write_config_at(&path, &cfg).unwrap();
+        let read = read_config_at(&path).unwrap();
+        assert_eq!(read, cfg);
+        assert!(imaging_enabled_from_value(&read));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn imaging_enabled_defaults_false_when_absent_or_off() {
+        assert!(!imaging_enabled_from_value(&serde_json::json!({})));
+        assert!(!imaging_enabled_from_value(
+            &serde_json::json!({ "imaging": {} })
+        ));
+        assert!(!imaging_enabled_from_value(
+            &serde_json::json!({ "imaging": { "enabled": false } })
+        ));
+        assert!(imaging_enabled_from_value(
+            &serde_json::json!({ "imaging": { "enabled": true } })
+        ));
+    }
+
+    #[test]
+    fn local_capabilities_gated_on_node() {
+        assert_eq!(local_capabilities(true), vec!["imaging.local.v1".to_string()]);
+        assert!(local_capabilities(false).is_empty());
     }
 }
