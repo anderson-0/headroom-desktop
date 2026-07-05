@@ -15,6 +15,13 @@ pub fn detect_codex_cli() -> Option<PathBuf> {
     detect_cli("codex")
 }
 
+/// Locate `npx` (for the pxpipe imaging sidecar, plan 06). Uses the same
+/// known-paths + login-shell probe as the CLIs, so it resolves nvm/fnm/volta/bun
+/// Node installs that a Finder-launched app's stripped PATH can't see.
+pub fn detect_npx() -> Option<PathBuf> {
+    detect_cli("npx")
+}
+
 fn detect_cli(name: &str) -> Option<PathBuf> {
     if let Some(path) = probe_known_paths(name) {
         return Some(path);

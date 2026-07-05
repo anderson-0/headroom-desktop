@@ -8,7 +8,7 @@
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::process::CommandExt; // matches tool_manager.rs; unix-only, like the rest of the spawn path
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -56,25 +56,11 @@ fn spawn_env(port: u16, upstream: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// First existing `name` across `PATH`. `exists` is injected so tests don't touch
-/// the real filesystem.
-fn locate_executable(
-    name: &str,
-    path_var: &str,
-    exists: impl Fn(&Path) -> bool,
-) -> Option<PathBuf> {
-    for dir in std::env::split_paths(path_var) {
-        let candidate = dir.join(name);
-        if exists(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
+/// Locate `npx`. Delegates to the shared CLI resolver (known paths + login-shell
+/// probe) so it finds nvm/fnm/volta/bun Node installs that a Finder-launched
+/// app's stripped PATH wouldn't otherwise see.
 fn locate_npx() -> Option<PathBuf> {
-    let path = std::env::var("PATH").unwrap_or_default();
-    locate_executable("npx", &path, |p| p.exists())
+    crate::claude_cli::detect_npx()
 }
 
 fn sidecar_healthy(port: u16) -> bool {
@@ -251,24 +237,6 @@ mod tests {
         assert!(env.contains(&("PORT", "47821".to_string())));
         assert!(env.contains(&("HOST", "127.0.0.1".to_string())));
         assert!(env.contains(&("ANTHROPIC_UPSTREAM", "https://api.anthropic.com".to_string())));
-    }
-
-    #[test]
-    fn locate_executable_returns_first_hit_on_path() {
-        let path = "/usr/local/bin:/opt/homebrew/bin:/usr/bin";
-        // Only /opt/homebrew/bin/npx "exists".
-        let found = locate_executable("npx", path, |p| {
-            p == Path::new("/opt/homebrew/bin/npx")
-        });
-        assert_eq!(found, Some(PathBuf::from("/opt/homebrew/bin/npx")));
-    }
-
-    #[test]
-    fn locate_executable_none_when_absent() {
-        assert_eq!(
-            locate_executable("npx", "/usr/bin:/bin", |_| false),
-            None
-        );
     }
 
     #[test]
