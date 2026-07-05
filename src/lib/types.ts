@@ -151,6 +151,7 @@ export interface ClientSetupResult {
   nextSteps: string[];
   verification: ClientSetupVerification;
   shellProfileUnwritable?: boolean;
+  replacedBaseUrl?: string | null;
 }
 
 export interface ClientSetupVerification {
@@ -471,6 +472,8 @@ export interface CodexUsage {
   recommendedSubscriptionTier?: HeadroomSubscriptionTier | null;
   weeklyUsedPercent?: number | null;
   gateMessage: string;
+  effectiveNudgeThresholdsPercent?: number[] | null;
+  effectiveDisableThresholdPercent?: number | null;
 }
 
 export interface HeadroomAccountProfile {

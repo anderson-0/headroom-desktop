@@ -36,10 +36,10 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// `*-manylinux_*` abi3 wheel from
 /// https://pypi.org/pypi/headroom-ai/<version>/json and add a per-platform
 /// wheel-picker (mirroring `python_distribution_artifact`).
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.28.0";
-const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/b7/ad/a8e3a083851304e94707e305efcd9d94fac8bd605a31118ec18926211c1a/headroom_ai-0.28.0-cp310-abi3-macosx_11_0_arm64.whl";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.30.0";
+const HEADROOM_PINNED_WHEEL_URL: &str = "https://files.pythonhosted.org/packages/d1/61/bd6495a33d1cb098da61c651f803fe309acaa5331e4b92381b825cf868b9/headroom_ai-0.30.0-cp310-abi3-macosx_11_0_arm64.whl";
 const HEADROOM_PINNED_SHA256: &str =
-    "31d3b280e7366a23f54034de15f525c3676e185464caa4e8696cd8ce2bad9fa6";
+    "9b10f4dec6451fce652fdb775e7dc7a999e98d3ee853d1eb569a7e2e550d79c5";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
@@ -193,6 +193,45 @@ const ATOMIC_REBUILD_FLOOR_VERSION: (u32, u32, u32) = (0, 20, 0);
 /// pre-release/build suffixes (`-rc.1`, `+build`, `.dev0`, etc.). Returns
 /// None when the prefix isn't a numeric `major.minor`. `patch` defaults to
 /// 0 when missing or unparseable, so `"0.19"` and `"0.19.0"` compare equal.
+/// Injected onto the backend's PYTHONPATH so the `site` module imports it at
+/// interpreter startup. `faulthandler.register` needs Python-side code — the
+/// PYTHONFAULTHANDLER env only covers fatal signals — and the upstream proxy
+/// has no dump hook of its own.
+const SITECUSTOMIZE_PY: &str = r#""""Headroom Desktop injection (managed -- do not edit).
+
+Registers SIGUSR1 to dump all Python thread stacks to stderr (the proxy
+log). The desktop watchdog sends SIGUSR1 before force-killing a wedged
+backend so the log shows what the event loop was stuck on.
+"""
+import faulthandler
+import signal
+
+# No chain=True: SIGUSR1's default disposition is terminate, and chaining
+# falls through to it after the dump -- the process must survive the dump so
+# the watchdog controls the actual kill.
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except Exception:
+    pass
+"#;
+
+/// Pre-upstream concurrency passed to the backend: 2x logical cores,
+/// clamped to [8, 64]. See the spawn-site comment for why the proxy's own
+/// 8-cap is safe to exceed under the desktop's env. An explicit
+/// `HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY` in the environment wins, so a
+/// power user with 30+ concurrent sessions can raise it without a rebuild.
+fn pre_upstream_concurrency() -> usize {
+    if let Some(n) = std::env::var("HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return n;
+    }
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    (cores * 2).clamp(8, 64)
+}
+
 fn parse_major_minor_patch(s: &str) -> Option<(u32, u32, u32)> {
     let head = s.split(|c: char| c == '-' || c == '+').next()?;
     let mut parts = head.split('.');
@@ -451,6 +490,9 @@ fn classify_kompress_prefetch_failure(tail: &str) -> &'static str {
         || t.contains("max retries exceeded")
         || t.contains("ssl")
         || t.contains("httperror")
+        // huggingface_hub 1.x transient: shared httpx client torn down mid-pull
+        // (RUST-3C). A fresh subprocess gets a fresh client, so it's retriable.
+        || t.contains("client has been closed")
     {
         "network"
     } else if t.contains("permission denied") {
@@ -808,7 +850,12 @@ impl ToolManager {
             // -m double-import RuntimeWarning. Fall back to -m if missing.
             let startup_variants: Vec<(PathBuf, Vec<String>)> = if entrypoint.exists() {
                 vec![
-                    (entrypoint, headroom_entrypoint_startup_args()),
+                    (
+                        entrypoint,
+                        headroom_entrypoint_startup_args(
+                            self.installed_headroom_version().as_deref(),
+                        ),
+                    ),
                     (python.clone(), headroom_python_startup_args()),
                 ]
             } else {
@@ -828,6 +875,17 @@ impl ToolManager {
                     .open(&log_path)
                     .with_context(|| format!("opening {}", log_path.display()))?;
 
+                // SIGUSR1 -> faulthandler dump of all Python threads into the
+                // proxy log (see SITECUSTOMIZE_PY). The dir holds nothing but
+                // sitecustomize.py, so PYTHONPATH can't shadow real imports.
+                // Best-effort: a failed write only costs the wedge diagnostics.
+                let inject_dir = self.runtime.root_dir.join("pyinject");
+                if let Err(err) = std::fs::create_dir_all(&inject_dir).and_then(|_| {
+                    std::fs::write(inject_dir.join("sitecustomize.py"), SITECUSTOMIZE_PY)
+                }) {
+                    log::warn!("[tool_manager] writing pyinject/sitecustomize.py failed: {err}");
+                }
+
                 // Wrap with `nice` so headroom yields CPU to foreground apps
                 // (Claude Code, terminal, etc.) when the machine is contended.
                 // On idle systems headroom still runs at full speed.
@@ -843,6 +901,7 @@ impl ToolManager {
                     .current_dir(&self.runtime.root_dir)
                     .process_group(0)
                     .env("PYTHONNOUSERSITE", "1")
+                    .env("PYTHONPATH", &inject_dir)
                     .env("PYTHONUNBUFFERED", "1")
                     .env("PYTHONFAULTHANDLER", "1")
                     .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
@@ -856,6 +915,9 @@ impl ToolManager {
                     // back to the stable HTTPS download path.
                     .env("HF_HUB_DISABLE_XET", "1")
                     .env("HEADROOM_SDK", "headroom-desktop-proxy")
+                    // Anonymous aggregate telemetry (opt-in in the package,
+                    // off by default). Desktop opts in on the user's behalf.
+                    .env("HEADROOM_TELEMETRY", "on")
                     .env("HEADROOM_HTTP2", "false")
                     // Disable the HTTP/1.1 keep-alive pool for the upstream
                     // (proxy -> api.anthropic.com) client. Claude Code cancels
@@ -872,6 +934,20 @@ impl ToolManager {
                     // were removed; cache mode contributed no measurable savings over
                     // Claude Code's native prefix caching.)
                     .env("HEADROOM_MODE", "token")
+                    // Off-path background compression (#1171). The Kompress ML pass
+                    // over the stable prefix is CPU-bound Rust that releases the GIL,
+                    // so 3+ concurrent Claude Code sessions run their passes in true
+                    // parallel and saturate CPU. Each pass then stretches past the 30s
+                    // COMPRESSION_TIMEOUT; asyncio cancels the awaiter but the Rust
+                    // worker is non-preemptible and keeps burning a core to completion
+                    // (a "leaked thread"), so the machine never drains and every
+                    // session stalls ~30s/request -> apparent freeze. With this on, a
+                    // cold-start-large request forwards uncompressed immediately and
+                    // compresses on a dedicated single-thread background pool that
+                    // never contends with the request path, breaking the cascade.
+                    // Costs first-turn savings per session; steady state recovers once
+                    // the prefix is compressed once.
+                    .env("HEADROOM_BACKGROUND_COMPRESSION", "1")
                     // Pin per-request auth-mode policy enforcement ON. This is what
                     // keeps OAuth/subscription traffic (Claude Code, classified
                     // SUBSCRIPTION by User-Agent) on the conservative
@@ -884,17 +960,17 @@ impl ToolManager {
                     // returns policy_default_payg() when enforcement is off) -- a
                     // net loss on cache-billed subscription sessions.
                     .env("HEADROOM_PROXY_AUTH_MODE_POLICY_ENFORCEMENT", "enabled")
-                    // Enable plain user-message text compression in addition to
-                    // tool results. Primary motive is Codex/OpenAI: with a 0.5
-                    // read-discount and 0.0 write-penalty, compressing user text
-                    // clears the force-compress threshold and yields real savings.
-                    // This is the only desktop-side lever (the `headroom proxy`
-                    // entrypoint reads this env only; it exposes no CLI flag), and
-                    // it is process-global on the single shared proxy. Anthropic
-                    // blast radius is small: its 0.9 read-discount means already-
-                    // cached content almost never busts the frozen prefix, and
-                    // protect_recent/min_tokens guard the just-typed prompt.
-                    .env("HEADROOM_COMPRESS_USER_MESSAGES", "1")
+                    // User-message text compression is intentionally left OFF
+                    // (proxy default: user turns are protected). It's a single
+                    // process-global switch with no per-provider scoping, so the
+                    // choice is on-for-both-clients or off-for-both. We keep it off
+                    // to protect the coding working set carried in user turns (code,
+                    // errors, paths the model must see verbatim) and because the
+                    // token mass is tool_results, which compress regardless — this
+                    // also matches the "coding" savings persona, which sets
+                    // compress_user_messages=False. Trade-off: gives up the modest
+                    // Codex/OpenAI user-text savings (0.5 read-discount, 0.0
+                    // write-penalty) that HEADROOM_COMPRESS_USER_MESSAGES=1 enabled.
                     // Output-token shaping (new in headroom-ai 0.27.0). The proxy
                     // never emits output tokens, so this works request-side: it
                     // appends a byte-stable verbosity instruction to the TAIL of
@@ -915,6 +991,32 @@ impl ToolManager {
                     // baseline still feeds the /stats savings estimate. Level 2 =
                     // skip pre/postamble, don't restate in-context code/tool output.
                     .env("HEADROOM_VERBOSITY_LEVEL", "2")
+                    // Agent savings persona (new in headroom-ai 0.30.0). The
+                    // `proxy` entrypoint reads HEADROOM_SAVINGS_PROFILE into
+                    // config.savings_profile, and proxy_pipeline_kwargs() applies
+                    // the persona's compression knobs per request across all
+                    // handlers. The "coding" persona holds the active code working
+                    // set verbatim (protect_recent=2, protect_analysis_context,
+                    // smart_crusher_with_compaction) with a low min_tokens so
+                    // compression stays visible, and target_ratio unset so savings
+                    // emerge from lossless + relevance rather than a forced keep.
+                    // The persona also sets compress_user_messages=False (avoids
+                    // prompt mutation / prefix-cache busting); this now applies
+                    // cleanly since we no longer force HEADROOM_COMPRESS_USER_MESSAGES
+                    // on, so user turns stay protected as the persona intends.
+                    .env("HEADROOM_SAVINGS_PROFILE", "coding")
+                    // Pre-upstream concurrency. The proxy's own auto is
+                    // max(2, min(8, cpu_count)) — hard-capped at 8 to protect the
+                    // event loop from CPU-bound compression. The desktop runs with
+                    // HEADROOM_BACKGROUND_COMPRESSION=1 (above), which moves that
+                    // CPU work off the request path, so the semaphore slots are
+                    // mostly I/O-bound and the 8-cap just queues heavy multi-agent
+                    // load (30+ sessions) until acquire timeouts degrade /readyz
+                    // and the watchdog force-kills. Scale with cores instead.
+                    .env(
+                        "HEADROOM_ANTHROPIC_PRE_UPSTREAM_CONCURRENCY",
+                        pre_upstream_concurrency().to_string(),
+                    )
                     .stdin(Stdio::null())
                     .stdout(Stdio::from(
                         log_file
@@ -1298,9 +1400,18 @@ impl ToolManager {
         // rather than restarting it. Retry only network-category failures
         // (RUST-3C): a dropped connection or TLS blip on the ~315MB model is
         // exactly what a second attempt fixes; permission/other failures won't
-        // improve on retry. ponytail: 3 attempts, linear backoff -- raise only
-        // if telemetry shows partials still not converging within a launch.
-        const MAX_ATTEMPTS: u32 = 3;
+        // improve on retry.
+        //
+        // Why retries at the subprocess level at all: huggingface_hub 1.21.0's
+        // own in-process backoff self-destructs on the first ConnectError --
+        // `_http_backoff_base` caches `client = get_session()` before its retry
+        // loop, the ConnectError handler calls `close_session()`, and the next
+        // iteration reuses the closed client, raising "RuntimeError: Cannot
+        // send a request, as the client has been closed" (the exact RUST-3C
+        // message). A fresh subprocess gets a fresh client and resumes the
+        // blob. ponytail: 5 attempts, linear backoff -- raised from 3 after
+        // 0.5.9 telemetry showed hosts burning all 3 (RUST-45 -> RUST-3C).
+        const MAX_ATTEMPTS: u32 = 5;
         for attempt in 1..=MAX_ATTEMPTS {
             match self.run_kompress_prefetch_once(&python, &log_path)? {
                 KompressPrefetchOutcome::Downloaded => {
@@ -1530,7 +1641,7 @@ impl ToolManager {
         } else {
             return Ok(());
         }
-        std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?)
+        crate::client_adapters::atomic_write(&receipt_path, &serde_json::to_vec(&receipt)?)
             .with_context(|| format!("writing {}", receipt_path.display()))?;
         Ok(())
     }
@@ -1620,10 +1731,6 @@ impl ToolManager {
         });
 
         Ok(())
-    }
-
-    pub fn bootstrap_all(&self) -> Result<ManagedRuntime> {
-        self.bootstrap_all_with_progress(|_| {})
     }
 
     pub fn bootstrap_all_with_progress<F>(&self, mut progress: F) -> Result<ManagedRuntime>
@@ -1756,9 +1863,43 @@ impl ToolManager {
             .with_context(|| format!("opening {}", archive_path.display()))?;
         let decoder = GzDecoder::new(file);
         let mut archive = Archive::new(decoder);
+        // Extract to a staging dir and rename into place. Unpacking straight
+        // into runtime_dir used to be a permanent trap: a crash mid-unpack
+        // after bin/python3 landed made every later launch's `exists()` gate
+        // read "installed" while the stdlib was incomplete — and no repair
+        // path covers runtime/python, so it stayed broken until manual
+        // deletion.
+        let staging_dir = self.runtime.runtime_dir.join("python.extracting");
+        if staging_dir.exists() {
+            std::fs::remove_dir_all(&staging_dir)
+                .with_context(|| format!("clearing stale {}", staging_dir.display()))?;
+        }
+        std::fs::create_dir_all(&staging_dir)
+            .with_context(|| format!("creating {}", staging_dir.display()))?;
         archive
-            .unpack(&self.runtime.runtime_dir)
-            .with_context(|| format!("extracting into {}", self.runtime.runtime_dir.display()))?;
+            .unpack(&staging_dir)
+            .with_context(|| format!("extracting into {}", staging_dir.display()))?;
+
+        // The tarball's single root is `python/`.
+        let extracted_root = staging_dir.join("python");
+        if !extracted_root.join("bin").join("python3").exists() {
+            bail!(
+                "standalone python extraction completed but {} was not found",
+                extracted_root.join("bin/python3").display()
+            );
+        }
+        if self.runtime.python_dir.exists() {
+            std::fs::remove_dir_all(&self.runtime.python_dir).with_context(|| {
+                format!("removing partial {}", self.runtime.python_dir.display())
+            })?;
+        }
+        std::fs::rename(&extracted_root, &self.runtime.python_dir).with_context(|| {
+            format!(
+                "publishing extracted python into {}",
+                self.runtime.python_dir.display()
+            )
+        })?;
+        let _ = std::fs::remove_dir_all(&staging_dir);
 
         if !self.runtime.standalone_python().exists() {
             bail!(
@@ -1858,10 +1999,18 @@ impl ToolManager {
             percent: 40,
         });
 
-        // Try direct wheel download (with retries). If it fails, fall back to PyPI index.
+        // Try direct wheel download (with retries). If the transfer fails,
+        // fall back to the PyPI index; a checksum mismatch fails hard instead
+        // — the fallback has no hash verification, so downgrading on mismatch
+        // would bypass the integrity check exactly when it fires.
         let use_wheel =
             match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
                 Ok(()) => true,
+                Err(download_err) if is_checksum_mismatch(&download_err) => {
+                    return Err(download_err.context(
+                        "Headroom wheel failed checksum verification; refusing unverified fallback",
+                    ));
+                }
                 Err(download_err) => {
                     log::warn!(
                     "headroom wheel download failed (will fall back to pip index): {download_err}"
@@ -2034,7 +2183,7 @@ impl ToolManager {
                     );
                 }
                 receipt["mcp"] = mcp_install;
-                std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?)
+                crate::client_adapters::atomic_write(&receipt_path, &serde_json::to_vec(&receipt)?)
                     .with_context(|| format!("writing {}", receipt_path.display()))?;
             }
         }
@@ -2120,6 +2269,16 @@ impl ToolManager {
     /// base converters and their dependencies import). No-op when the addon
     /// isn't installed, so it can be called unconditionally from a smoke pass.
     pub fn smoke_test_markitdown(&self) -> Result<()> {
+        // First execution after an upgrade pays Gatekeeper/EDR scanning of the
+        // freshly-written venv plus cold imports, which can blow the 60s
+        // timeout (RUST-22). A retry runs with warm caches; only a repeat
+        // failure is a real signal.
+        if self
+            .smoke_test_markitdown_with_timeout(MARKITDOWN_SMOKE_TEST_TIMEOUT)
+            .is_ok()
+        {
+            return Ok(());
+        }
         self.smoke_test_markitdown_with_timeout(MARKITDOWN_SMOKE_TEST_TIMEOUT)
     }
 
@@ -2250,7 +2409,7 @@ impl ToolManager {
         if let Some(backup) = in_place_previous_lock_backup {
             body["previous_lock_backup"] = json!(backup);
         }
-        std::fs::write(&marker, serde_json::to_vec_pretty(&body)?)
+        crate::client_adapters::atomic_write(&marker, &serde_json::to_vec_pretty(&body)?)
             .with_context(|| format!("writing {}", marker.display()))?;
         Ok(())
     }
@@ -2303,12 +2462,33 @@ impl ToolManager {
                 "recover_from_interrupted_upgrade: in-place upgrade was in progress; \
                  reinstalling previous headroom-ai {previous_version}"
             );
+            // Both pip helpers need PyPI. Offline (laptop died mid-upgrade,
+            // reopened on a plane) they fail — and discarding those failures
+            // used to clear the marker anyway, leaving a mixed venv (new dep
+            // pins, unknown headroom-ai version) that the restored receipt
+            // declared healthy. On failure keep the marker AND the lock
+            // backup untouched so the next launch retries recovery; mirror
+            // `rollback_headroom_upgrade`, which propagates the same errors.
             if let Some(ref backup) = previous_lock_backup {
-                let _ = self.pip_restore_deps_from_backup(backup);
+                if let Err(err) = self.pip_restore_deps_from_backup(backup) {
+                    log::warn!(
+                        "recover_from_interrupted_upgrade: dep restore failed ({err:#}); \
+                         keeping upgrade marker for retry"
+                    );
+                    return false;
+                }
+            }
+            if let Err(err) = self.pip_force_reinstall_headroom_version(&previous_version) {
+                log::warn!(
+                    "recover_from_interrupted_upgrade: reinstalling headroom-ai \
+                     {previous_version} failed ({err:#}); keeping upgrade marker for retry"
+                );
+                return false;
+            }
+            if let Some(ref backup) = previous_lock_backup {
                 let _ = std::fs::copy(backup, self.active_lock_path());
                 let _ = std::fs::remove_file(backup);
             }
-            let _ = self.pip_force_reinstall_headroom_version(&previous_version);
             let receipt_backup = self.headroom_receipt_backup_path();
             let receipt_path = self.headroom_receipt_path();
             if receipt_backup.exists() {
@@ -2798,6 +2978,17 @@ impl ToolManager {
         let use_wheel =
             match download_to_path(&release.wheel_url, &wheel_path, Some(&release.sha256)) {
                 Ok(()) => true,
+                Err(download_err) if is_checksum_mismatch(&download_err) => {
+                    // Never downgrade a failed integrity check to an
+                    // unverified pip-index install.
+                    let restored = self.rollback_in_place_upgrade_inner(&ctx);
+                    return UpgradeOutcome::InstallFailed {
+                    restored,
+                    error: download_err.context(
+                        "Headroom wheel failed checksum verification; refusing unverified fallback",
+                    ),
+                };
+                }
                 Err(download_err) => {
                     log::warn!(
                     "headroom wheel download failed (will fall back to pip index): {download_err}"
@@ -3083,7 +3274,7 @@ impl ToolManager {
             );
         }
         receipt["mcp"] = mcp_install;
-        std::fs::write(&receipt_path, serde_json::to_vec_pretty(&receipt)?)
+        crate::client_adapters::atomic_write(&receipt_path, &serde_json::to_vec_pretty(&receipt)?)
             .with_context(|| format!("writing {}", receipt_path.display()))?;
         Ok(())
     }
@@ -3214,7 +3405,10 @@ impl ToolManager {
                     "proxyUrl": HEADROOM_PROXY_URL,
                     "installMethod": method.as_str(),
                 });
-                let _ = std::fs::write(&receipt_path, serde_json::to_vec(&receipt)?);
+                let _ = crate::client_adapters::atomic_write(
+                    &receipt_path,
+                    &serde_json::to_vec(&receipt)?,
+                );
             }
         }
         Ok(())
@@ -3406,21 +3600,34 @@ impl ToolManager {
             );
         }
 
+        // Stage next to the destination, then rename into place: rtk is
+        // exec'd by the PreToolUse hook on nearly every agent Bash command,
+        // so copying over the live binary opens a truncated-exec window (and
+        // fails with ETXTBSY on Linux while an rtk is running). Rename is
+        // atomic for exec.
         let destination = self.rtk_entrypoint();
-        std::fs::copy(&extracted_binary, &destination)
-            .with_context(|| format!("writing {}", destination.display()))?;
+        let staged = {
+            let mut s = destination.as_os_str().to_os_string();
+            s.push(".new");
+            PathBuf::from(s)
+        };
+        std::fs::copy(&extracted_binary, &staged)
+            .with_context(|| format!("writing {}", staged.display()))?;
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
 
-            let mut permissions = std::fs::metadata(&destination)
-                .with_context(|| format!("reading {}", destination.display()))?
+            let mut permissions = std::fs::metadata(&staged)
+                .with_context(|| format!("reading {}", staged.display()))?
                 .permissions();
             permissions.set_mode(0o755);
-            std::fs::set_permissions(&destination, permissions)
-                .with_context(|| format!("chmod {}", destination.display()))?;
+            std::fs::set_permissions(&staged, permissions)
+                .with_context(|| format!("chmod {}", staged.display()))?;
         }
+
+        std::fs::rename(&staged, &destination)
+            .with_context(|| format!("renaming {} into place", staged.display()))?;
 
         self.write_tool_receipt(
             "rtk",
@@ -3445,16 +3652,19 @@ impl ToolManager {
             .runtime
             .downloads_dir
             .join("headroom-requirements.lock");
-        std::fs::write(&lock_path, contents)
+        crate::client_adapters::atomic_write(&lock_path, contents.as_bytes())
             .with_context(|| format!("writing {}", lock_path.display()))?;
         Ok(lock_path)
     }
 
     fn write_bootstrap_receipt(&self) -> Result<()> {
         let receipt = self.runtime.root_dir.join("bootstrap-receipt.json");
-        std::fs::write(
+        // Receipts/flags gate bootstrap and upgrade decisions: a truncated one
+        // reads as "not installed" and triggers a multi-minute rebuild, so all
+        // of them go through tmp+rename.
+        crate::client_adapters::atomic_write(
             &receipt,
-            serde_json::to_vec_pretty(&json!({
+            &serde_json::to_vec_pretty(&json!({
                 "managedBy": "Headroom",
                 "runtime": "python",
                 "scope": "self-contained",
@@ -3473,14 +3683,15 @@ impl ToolManager {
 
     fn write_ready_flag(&self) -> Result<()> {
         let ready_flag = self.runtime.ready_flag();
-        std::fs::write(
+        crate::client_adapters::atomic_write(
             &ready_flag,
             json!({
                 "managedPython": self.runtime.managed_python(),
                 "managedPip": self.runtime.managed_pip(),
                 "scope": "self-contained"
             })
-            .to_string(),
+            .to_string()
+            .as_bytes(),
         )
         .with_context(|| format!("writing {}", ready_flag.display()))?;
         Ok(())
@@ -3488,9 +3699,9 @@ impl ToolManager {
 
     fn write_tool_receipt(&self, tool_id: &str, payload: serde_json::Value) -> Result<()> {
         let path = self.runtime.tools_dir.join(format!("{tool_id}.json"));
-        std::fs::write(
+        crate::client_adapters::atomic_write(
             &path,
-            serde_json::to_vec_pretty(&payload).context("serializing managed tool receipt")?,
+            &serde_json::to_vec_pretty(&payload).context("serializing managed tool receipt")?,
         )
         .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
@@ -3533,7 +3744,8 @@ impl ToolManager {
     }
 
     pub fn markitdown_installed(&self) -> bool {
-        self.runtime.tools_dir.join("markitdown.json").exists() && self.markitdown_entrypoint().exists()
+        self.runtime.tools_dir.join("markitdown.json").exists()
+            && self.markitdown_entrypoint().exists()
     }
 
     pub fn install_markitdown(&self) -> Result<()> {
@@ -3686,12 +3898,19 @@ impl ToolManager {
                     "Your Codex CLI is too old to install the ponytail plugin. Update Codex, then try again."
                 );
             }
-            bail!("installing the ponytail plugin failed: {}", errors.join("; "));
+            bail!(
+                "installing the ponytail plugin failed: {}",
+                errors.join("; ")
+            );
         }
         if !errors.is_empty() {
-            log::warn!("ponytail installed for some hosts but not all: {}", errors.join("; "));
+            log::warn!(
+                "ponytail installed for some hosts but not all: {}",
+                errors.join("; ")
+            );
         }
-        let version = installed_ponytail_version().unwrap_or_else(|| PONYTAIL_DISPLAY_VERSION.into());
+        let version =
+            installed_ponytail_version().unwrap_or_else(|| PONYTAIL_DISPLAY_VERSION.into());
         self.write_tool_receipt("ponytail", json!({ "version": version, "enabled": true }))?;
         Ok(codex_outdated)
     }
@@ -3724,8 +3943,12 @@ impl ToolManager {
         if !changed_any && !errors.is_empty() {
             bail!("toggling ponytail failed: {}", errors.join("; "));
         }
-        let version = installed_ponytail_version().unwrap_or_else(|| PONYTAIL_DISPLAY_VERSION.into());
-        self.write_tool_receipt("ponytail", json!({ "version": version, "enabled": enabled }))?;
+        let version =
+            installed_ponytail_version().unwrap_or_else(|| PONYTAIL_DISPLAY_VERSION.into());
+        self.write_tool_receipt(
+            "ponytail",
+            json!({ "version": version, "enabled": enabled }),
+        )?;
         Ok(())
     }
 
@@ -3881,7 +4104,10 @@ fn codex_ponytail_present() -> bool {
 
 fn installed_ponytail_version() -> Option<String> {
     let plugins = ponytail_installed_plugins()?;
-    let installs = plugins.get("plugins")?.get(PONYTAIL_PLUGIN_REF)?.as_array()?;
+    let installs = plugins
+        .get("plugins")?
+        .get(PONYTAIL_PLUGIN_REF)?
+        .as_array()?;
     installs
         .first()?
         .get("version")?
@@ -3918,36 +4144,87 @@ fn write_headroom_to_claude_json(entrypoint: &Path, proxy_url: &str) -> Result<(
     let Some(home) = dirs::home_dir() else {
         anyhow::bail!("home directory not available");
     };
-    let path = home.join(".claude.json");
+    write_headroom_to_claude_json_at(&home.join(".claude.json"), entrypoint, proxy_url)
+}
 
-    let mut config: Value = if path.exists() {
-        std::fs::read(&path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_else(|| json!({}))
-    } else {
-        json!({})
-    };
+fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &str) -> Result<()> {
+    let desired = json!({
+        "command": entrypoint,
+        "args": ["mcp", "serve"],
+        "env": { "HEADROOM_PROXY_URL": proxy_url },
+    });
 
-    let root = config
-        .as_object_mut()
-        .context("~/.claude.json root is not a JSON object")?;
+    let modified_time = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
 
-    root.entry("mcpServers")
-        .or_insert_with(|| json!({}))
-        .as_object_mut()
-        .context("~/.claude.json mcpServers is not a JSON object")?
-        .insert(
-            "headroom".into(),
-            json!({
-                "command": entrypoint,
-                "args": ["mcp", "serve"],
-                "env": { "HEADROOM_PROXY_URL": proxy_url },
-            }),
-        );
+    // ~/.claude.json holds OAuth state and per-project settings, and Claude
+    // Code rewrites it frequently — often while this runs (bootstrap,
+    // upgrade, requirements repair). Two defenses against reverting a
+    // concurrent Claude Code write with our stale snapshot: skip the publish
+    // entirely when our entry is already present and correct (the common
+    // case on every repair), and re-check the file's mtime just before the
+    // rename, retrying the whole read-modify-write if it moved.
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 0..MAX_ATTEMPTS {
+        let seen_modified = modified_time(path);
 
-    std::fs::write(&path, serde_json::to_vec_pretty(&config)?)
-        .with_context(|| format!("writing {}", path.display()))
+        // A read or parse failure (e.g. a mid-write partial file) must never
+        // degrade to an empty object, or the write below replaces the user's
+        // entire config with just our entry.
+        let mut config: Value = if path.exists() {
+            let bytes =
+                std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+            if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+                json!({})
+            } else {
+                serde_json::from_slice(&bytes).with_context(|| {
+                    format!(
+                        "parsing {} failed; refusing to overwrite potentially valid user config",
+                        path.display()
+                    )
+                })?
+            }
+        } else {
+            json!({})
+        };
+
+        if config
+            .get("mcpServers")
+            .and_then(|servers| servers.get("headroom"))
+            == Some(&desired)
+        {
+            return Ok(());
+        }
+
+        let root = config
+            .as_object_mut()
+            .context("~/.claude.json root is not a JSON object")?;
+
+        root.entry("mcpServers")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .context("~/.claude.json mcpServers is not a JSON object")?
+            .insert("headroom".into(), desired.clone());
+
+        let _ = crate::client_adapters::backup_if_exists(path)?;
+
+        // Publish atomically (tmp + rename) so a crash mid-write can never
+        // leave a truncated ~/.claude.json behind.
+        let mut tmp = path.as_os_str().to_os_string();
+        tmp.push(".headroom-tmp");
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+
+        if modified_time(path) != seen_modified && attempt + 1 < MAX_ATTEMPTS {
+            // Claude Code wrote while we worked — merge against the new
+            // contents instead of reverting them.
+            let _ = std::fs::remove_file(&tmp);
+            continue;
+        }
+        return std::fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} into place", tmp.display()));
+    }
+    unreachable!("loop always returns")
 }
 
 fn is_local_proxy_reachable() -> bool {
@@ -3974,10 +4251,35 @@ fn diagnose_proxy_port(port: u16) -> PortState {
     // non-HTTP service (SSH, Redis, etc.) will not.
     let headroom_like = probe_headroom_http(port, Duration::from_millis(400));
     if headroom_like {
-        PortState::HeadroomRunning
+        // "Speaks HTTP" alone is not identity. HeadroomRunning occupants get
+        // killed by the reclaim path, so verify the pid's argv actually looks
+        // like our managed backend — an unrelated local HTTP server (dev
+        // server, docker forward) squatting the port must route to the
+        // foreign fallback-port path instead of being SIGKILLed.
+        let detail = lsof_listener(port).unwrap_or_else(|| "unknown process".into());
+        match parse_pid_from_lsof_detail(&detail) {
+            Some(pid) if pid_is_headroom_backend(pid) => PortState::HeadroomRunning,
+            _ => PortState::ForeignOccupant(detail),
+        }
     } else {
         PortState::ForeignOccupant(lsof_listener(port).unwrap_or_else(|| "unknown process".into()))
     }
+}
+
+/// True when `pid`'s full command line looks like Headroom's managed backend
+/// (venv python under the Headroom app-support tree, or anything
+/// headroom-branded). Guards port reclaim from killing an unrelated process
+/// that merely answers HTTP on our port.
+fn pid_is_headroom_backend(pid: u32) -> bool {
+    let Ok(output) = Command::new("/bin/ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .to_lowercase()
+        .contains("headroom")
 }
 
 fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
@@ -4098,6 +4400,12 @@ fn reclaim_orphan_proxy(port: u16, force_unhealthy_too: bool) -> Result<()> {
     else {
         bail!("{}", format_already_running_bail(port));
     };
+    // Belt-and-braces identity gate (diagnose_proxy_port already filters, but
+    // the upgrade flow reaches here with force set): never kill a pid that
+    // doesn't look like our own backend.
+    if !pid_is_headroom_backend(pid) {
+        bail!("{}", format_already_running_bail(port));
+    }
 
     log::warn!("[backend_port] reclaiming orphaned headroom proxy pid {pid} on port {port}");
     let _ = Command::new("/bin/kill").arg(pid.to_string()).status();
@@ -4244,22 +4552,42 @@ fn headroom_python_startup_args() -> Vec<String> {
     ]
 }
 
-fn headroom_entrypoint_startup_args() -> Vec<String> {
+/// The `headroom proxy` click entrypoint only defines `--no-http2` from
+/// 0.28.0 (upstream e06b6167); 0.26.0/0.27.0 exit 2 with "No such option",
+/// which made boot validation on the 0.26.0 fallback runtime fail every
+/// attempt and time out (Sentry RUST-4A). Unknown/unparseable version means
+/// the receipt is from a current install, so assume the pinned (>= 0.28.0)
+/// runtime and keep the flag.
+fn runtime_supports_no_http2(installed_version: Option<&str>) -> bool {
+    let Some(version) = installed_version else {
+        return true;
+    };
+    let mut parts = version.split('.').map(|p| p.parse::<u64>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (0, 28),
+        _ => true,
+    }
+}
+
+fn headroom_entrypoint_startup_args(installed_version: Option<&str>) -> Vec<String> {
     // HTTP/2 to upstream is disabled both ways: the explicit --no-http2 flag
     // AND the HEADROOM_HTTP2=false env var (set in the spawn env). Either alone
     // suffices, but older bundled runtimes ignored the env var and ran HTTP/2
     // unconditionally, which surfaced as SSLV3_ALERT_BAD_RECORD_MAC under
     // multi-tab concurrency. The flag is belt-and-suspenders against a future
-    // runtime regressing on the env var. --log-messages stores full
-    // request/response bodies so the desktop's Activity tab can render the
-    // live transformations feed.
+    // runtime regressing on the env var — but only on runtimes whose click
+    // entrypoint defines it (see runtime_supports_no_http2). --log-messages
+    // stores full request/response bodies so the desktop's Activity tab can
+    // render the live transformations feed.
     let mut args = vec![
         "proxy".to_string(),
         "--port".to_string(),
         headroom_proxy_port(),
-        "--no-http2".to_string(),
-        "--log-messages".to_string(),
     ];
+    if runtime_supports_no_http2(installed_version) {
+        args.push("--no-http2".to_string());
+    }
+    args.push("--log-messages".to_string());
     args.extend(headroom_learn_startup_args());
     args
 }
@@ -4563,6 +4891,15 @@ fn rtk_distribution_artifact() -> Result<DownloadArtifact> {
 
 fn download_to_path(url: &str, destination: &Path, expected_sha256: Option<&str>) -> Result<()> {
     download_to_path_with_progress(url, destination, expected_sha256, |_, _| {})
+}
+
+/// True when a `download_to_path` failure was a sha256 mismatch (see the
+/// `bail!` in `download_to_path_with_progress`) rather than a transfer error.
+/// A mismatch means the bytes were tampered with or corrupted in transit —
+/// exactly the case the hash exists for — so callers must never respond to it
+/// by falling back to an unverified pip-index install.
+fn is_checksum_mismatch(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains("checksum mismatch")
 }
 
 /// Download `url` to `destination` with an optional progress callback.
@@ -5597,28 +5934,55 @@ impl std::error::Error for HeadroomStartupFailure {}
 mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use chrono::Local;
 
     use super::{
         bootstrap_requirements_lock_for_target, classify_kompress_prefetch_failure,
-        extract_required_pydantic_core_version, format_all_foreign_bail,
-        format_already_running_bail, headroom_entrypoint_startup_args, httpx_ca_bundle_bridge_from,
-        headroom_python_startup_args, is_outdated_codex, looks_like_corrupt_venv_error,
-        parse_major_minor_patch,
-        parse_pid_from_lsof_detail, probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
-        path_with_binary_dir, read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive,
-        requirements_lock_sha, rtk_distribution_artifact, run_command, sanitize_log_variant,
-        sha256_bytes, summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
-        CommandFailure, HeadroomRelease, ManagedRuntime, PipOutputCapture, ToolManager,
-        UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION, RTK_VERSION,
+        diagnose_proxy_port, extract_required_pydantic_core_version, format_all_foreign_bail,
+        format_already_running_bail, headroom_entrypoint_startup_args,
+        headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
+        is_outdated_codex, looks_like_corrupt_venv_error, parse_major_minor_patch,
+        parse_pid_from_lsof_detail, path_with_binary_dir, pre_upstream_concurrency,
+        probe_backend_readyz_ok, proxy_argv_contains_expected_flags,
+        read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
+        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
+        run_command, sanitize_log_variant, sha256_bytes, summarize_kompress_prefetch_failure,
+        verify_sha256_file, wait_for_port_free, CommandFailure, HeadroomRelease, ManagedRuntime,
+        PipOutputCapture, PortState, ToolManager, UpgradeOutcome, ATOMIC_REBUILD_FLOOR_VERSION,
+        RTK_VERSION,
     };
     use crate::backend_port;
     use crate::port_conflict;
     use std::net::TcpListener;
+
+    #[test]
+    fn is_checksum_mismatch_detects_bail_through_context_layers() {
+        // Pins the string coupling with download_to_path_with_progress's
+        // bail! — reword one side and the unverified-fallback guard dies.
+        let err = anyhow::anyhow!("checksum mismatch for https://x: expected aa, got bb")
+            .context("downloading wheel");
+        assert!(is_checksum_mismatch(&err));
+        assert!(!is_checksum_mismatch(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+    }
+
+    #[test]
+    fn sitecustomize_registers_nonchaining_sigusr1_dump() {
+        assert!(super::SITECUSTOMIZE_PY
+            .contains("faulthandler.register(signal.SIGUSR1, all_threads=True)"));
+        // chain=True would fall through to SIGUSR1's default terminate action.
+        assert!(!super::SITECUSTOMIZE_PY.contains("chain=True)"));
+    }
+
+    #[test]
+    fn pre_upstream_concurrency_stays_within_bounds() {
+        let value = pre_upstream_concurrency();
+        assert!((8..=32).contains(&value), "got {value}");
+    }
 
     #[test]
     fn httpx_ca_bundle_bridge_mirrors_requests_bundle() {
@@ -5658,6 +6022,12 @@ mod tests {
         assert_eq!(
             classify_kompress_prefetch_failure(
                 "requests.exceptions.ConnectionError: Max retries exceeded with url"
+            ),
+            "network"
+        );
+        assert_eq!(
+            classify_kompress_prefetch_failure(
+                "RuntimeError: Cannot send a request, as the client has been closed."
             ),
             "network"
         );
@@ -6149,7 +6519,9 @@ mod tests {
         let runtime = ManagedRuntime::bootstrap_root(&root);
         let manager = ToolManager::new(runtime.clone());
 
-        manager.bootstrap_all().expect("bootstrap succeeds");
+        manager
+            .bootstrap_all_with_progress(|_| {})
+            .expect("bootstrap succeeds");
 
         assert!(runtime.managed_python().exists());
         assert!(runtime.tools_dir.join("headroom.json").exists());
@@ -6336,10 +6708,14 @@ class H(http.server.BaseHTTPRequestHandler):
 S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
 "#;
 
+        // The trailing marker arg makes the stand-in pass the
+        // pid_is_headroom_backend argv identity gate, like a real orphan
+        // running from the Headroom app-support venv path would.
         let mut child = std::process::Command::new("/usr/bin/python3")
             .arg("-c")
             .arg(script)
             .arg(port.to_string())
+            .arg("--headroom-test-standin")
             .spawn()
             .expect("spawn stand-in proxy");
 
@@ -6371,6 +6747,60 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
             wait_for_port_free(port, Duration::from_secs(3)),
             "force=true must free the port"
         );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn reclaim_orphan_proxy_never_kills_foreign_http_server() {
+        let port = {
+            let l = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+
+        // An unrelated local HTTP server (no headroom marker in argv) that
+        // happens to hold the port: reclaim must bail — even with force — and
+        // leave the process alive.
+        let script = r#"
+import http.server, socketserver, sys
+class S(socketserver.TCPServer):
+    allow_reuse_address = True
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
+    def log_message(self, *a):
+        pass
+S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+"#;
+        let mut child = std::process::Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(script)
+            .arg(port.to_string())
+            .spawn()
+            .expect("spawn foreign http server");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !probe_backend_readyz_ok(port) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "foreign server never came up on port {port}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        assert!(
+            reclaim_orphan_proxy(port, true).is_err(),
+            "reclaim must refuse to kill a non-headroom occupant"
+        );
+        assert!(
+            probe_backend_readyz_ok(port),
+            "foreign occupant must still be alive after reclaim bails"
+        );
+        assert!(matches!(
+            diagnose_proxy_port(port),
+            PortState::ForeignOccupant(_)
+        ));
 
         let _ = child.kill();
         let _ = child.wait();
@@ -6414,7 +6844,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
     fn managed_headroom_startup_uses_supported_proxy_args() {
         backend_port::reset_for_tests();
         let default_port = backend_port::DEFAULT_BACKEND_PORT.to_string();
-        let entrypoint_args = headroom_entrypoint_startup_args();
+        let entrypoint_args = headroom_entrypoint_startup_args(Some("0.28.0"));
         assert!(entrypoint_args.starts_with(&[
             "proxy".to_string(),
             "--port".to_string(),
@@ -6449,6 +6879,36 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         backend_port::reset_for_tests();
     }
 
+    /// Regression (Sentry RUST-4A): the 0.26.0 fallback runtime's click
+    /// entrypoint has no `--no-http2` option, so passing it made every boot
+    /// validation attempt exit 2 and the upgrade time out. The flag must be
+    /// gated on runtime >= 0.28.0; unknown versions assume the pinned runtime.
+    #[test]
+    fn entrypoint_args_gate_no_http2_on_runtime_version() {
+        backend_port::reset_for_tests();
+
+        assert!(
+            !headroom_entrypoint_startup_args(Some("0.26.0")).contains(&"--no-http2".to_string())
+        );
+        assert!(
+            !headroom_entrypoint_startup_args(Some("0.27.0")).contains(&"--no-http2".to_string())
+        );
+        assert!(
+            headroom_entrypoint_startup_args(Some("0.28.0")).contains(&"--no-http2".to_string())
+        );
+        assert!(headroom_entrypoint_startup_args(Some("1.0.0")).contains(&"--no-http2".to_string()));
+        // Unknown or malformed receipt version: assume pinned runtime.
+        assert!(headroom_entrypoint_startup_args(None).contains(&"--no-http2".to_string()));
+        assert!(
+            headroom_entrypoint_startup_args(Some("garbage")).contains(&"--no-http2".to_string())
+        );
+        // The python -m argparse variant has defined --no-http2 since 0.10.0
+        // and must keep it unconditionally.
+        assert!(headroom_python_startup_args().contains(&"--no-http2".to_string()));
+
+        backend_port::reset_for_tests();
+    }
+
     /// Regression: `start_headroom_background` previously built `startup_variants`
     /// before pre-flight ran, so when fallback called `backend_port::set(6769)`
     /// the variants still spawned with `--port 6768` and both failed with
@@ -6460,7 +6920,7 @@ S(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
         backend_port::reset_for_tests();
         backend_port::set(6770);
 
-        let entrypoint_args = headroom_entrypoint_startup_args();
+        let entrypoint_args = headroom_entrypoint_startup_args(None);
         let port_idx = entrypoint_args
             .iter()
             .position(|a| a == "--port")
@@ -7100,12 +7560,42 @@ after
     }
 
     #[test]
+    fn recover_from_interrupted_upgrade_keeps_marker_when_pip_fails() {
+        // Offline / broken-python recovery: pip fails, so the marker and the
+        // receipt backup must survive for a retry on the next launch —
+        // clearing them used to leave a mixed venv that the restored receipt
+        // declared healthy.
+        let (root, runtime, manager) = seed_test_runtime("recover-pip-fails");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 1\n");
+        manager
+            .write_upgrade_marker("0.10.8", Some("0.10.7"), None)
+            .expect("marker");
+        fs::write(
+            manager.headroom_receipt_backup_path(),
+            br#"{"version":"0.10.7"}"#,
+        )
+        .expect("receipt snapshot");
+
+        assert!(!manager.recover_from_interrupted_upgrade());
+        assert!(
+            manager.upgrade_marker_path().exists(),
+            "marker kept for retry when pip fails"
+        );
+        assert!(
+            manager.headroom_receipt_backup_path().exists(),
+            "receipt backup kept for retry when pip fails"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn recover_from_interrupted_upgrade_handles_wheel_only_marker() {
         // In-place marker without a lock backup (wheel-only interrupted
-        // upgrade). The pip reinstall inside recovery fails harmlessly without
-        // a real python; we only assert the file-manipulation side: receipt
-        // restored, marker cleared.
+        // upgrade). A stub python stands in for a successful pip reinstall;
+        // we assert the file-manipulation side: receipt restored, marker
+        // cleared.
         let (root, runtime, manager) = seed_test_runtime("recover-wheel-only");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
         manager
             .write_upgrade_marker("0.10.8", Some("0.10.7"), None)
             .expect("marker");
@@ -7142,9 +7632,10 @@ after
     fn recover_from_interrupted_upgrade_handles_in_place_marker_with_lock_backup() {
         // In-place marker with a lock backup. Recovery should: copy the lock
         // backup back to the active lock path, remove the backup, restore the
-        // receipt, and clear the marker. Pip calls fail harmlessly without a
-        // real python.
+        // receipt, and clear the marker. A stub python stands in for
+        // successful pip calls.
         let (root, runtime, manager) = seed_test_runtime("recover-lock-backup");
+        write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
         let active_lock = manager.active_lock_path();
         let lock_backup = manager.lock_backup_path();
         fs::write(&active_lock, b"new-lock==2.0\n").expect("seed active lock");
@@ -7415,9 +7906,52 @@ after
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Points $HOME and $CODEX_HOME at the test root for the test's lifetime.
+    /// repair/bootstrap paths reach install_headroom_mcp, which writes MCP
+    /// registrations into ~/.claude.json and ~/.codex/config.toml — without
+    /// this guard a test run corrupts the developer's real agent configs with
+    /// a temp-dir entrypoint that macOS later deletes.
+    struct HomeGuard {
+        prev_home: Option<std::ffi::OsString>,
+        prev_codex: Option<std::ffi::OsString>,
+        _env_lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HomeGuard {
+        fn new(root: &Path) -> Self {
+            let env_lock = crate::test_env_lock::HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let prev_home = std::env::var_os("HOME");
+            let prev_codex = std::env::var_os("CODEX_HOME");
+            std::env::set_var("HOME", root);
+            std::env::remove_var("CODEX_HOME");
+            HomeGuard {
+                prev_home,
+                prev_codex,
+                _env_lock: env_lock,
+            }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.prev_home.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.prev_codex.take() {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+    }
+
     #[test]
+    #[serial_test::serial]
     fn repair_stale_requirements_updates_receipt_and_emits_progress() {
         let (root, runtime, manager) = seed_test_runtime("repair-requirements");
+        let _home = HomeGuard::new(&root);
         write_executable(&runtime.managed_python(), "#!/bin/sh\nexit 0\n");
         write_executable(&manager.headroom_entrypoint(), "#!/bin/sh\nexit 0\n");
         fs::write(
@@ -7559,7 +8093,10 @@ after
         let _ = fs::remove_dir_all(&root);
 
         install.expect("install_ponytail should succeed");
-        assert!(installed, "ponytail_installed() should be true after install");
+        assert!(
+            installed,
+            "ponytail_installed() should be true after install"
+        );
         smoke_while_installed.expect("smoke_test_ponytail should pass while installed");
         uninstall.expect("uninstall_ponytail should succeed");
         assert!(gone, "ponytail_installed() should be false after uninstall");
@@ -7588,7 +8125,9 @@ after
         assert!(!is_outdated_codex(&other));
 
         // A non-CommandFailure error must not be misclassified.
-        assert!(!is_outdated_codex(&anyhow::anyhow!("unrecognized subcommand")));
+        assert!(!is_outdated_codex(&anyhow::anyhow!(
+            "unrecognized subcommand"
+        )));
     }
 
     #[test]
@@ -7809,5 +8348,58 @@ exit 0
         cap.push("a");
         cap.push("b");
         assert_eq!(cap.into_string(), "a\nb");
+    }
+
+    #[test]
+    fn claude_json_write_preserves_existing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(
+            &path,
+            r#"{"oauthAccount":{"id":"abc"},"projects":{"/x":{}}}"#,
+        )
+        .unwrap();
+
+        super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
+            .unwrap();
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["oauthAccount"]["id"], "abc");
+        assert!(after["projects"]["/x"].is_object());
+        assert_eq!(after["mcpServers"]["headroom"]["command"], "/bin/headroom");
+    }
+
+    #[test]
+    fn claude_json_write_refuses_to_clobber_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(&path, r#"{"oauthAccount":{"id":"ab"#).unwrap(); // truncated mid-write
+
+        let err =
+            super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
+                .unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"));
+        // Original bytes untouched.
+        assert_eq!(fs::read(&path).unwrap(), br#"{"oauthAccount":{"id":"ab"#);
+    }
+
+    #[test]
+    fn claude_json_write_treats_empty_file_as_fresh_and_backs_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude.json");
+        fs::write(&path, "  \n").unwrap();
+
+        super::write_headroom_to_claude_json_at(&path, Path::new("/bin/headroom"), "http://p")
+            .unwrap();
+
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(after["mcpServers"]["headroom"].is_object());
+        // Backup taken, no tmp file left behind.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n.contains(".headroom-backup-")));
+        assert!(!names.iter().any(|n| n.ends_with(".headroom-tmp")));
     }
 }

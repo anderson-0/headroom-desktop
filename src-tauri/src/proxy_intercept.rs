@@ -31,9 +31,35 @@ use crate::models::{CodexPlanTier, CodexRateLimitSnapshot, CodexUsageWindow};
 pub const INTERCEPT_PORT: u16 = 6767;
 
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+// Request bodies arrive over loopback so even multi-MB payloads land in well
+// under a second; 30s is a generous stall bound, not a throughput budget.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Max requests forwarded to the Python backend concurrently. Each forward
+/// holds a client + backend FD for the request's full lifetime (SSE streams
+/// run for minutes), so an unbounded spawn pile-up under 30+ Claude Code
+/// sessions can starve accept() with EMFILE even after the startup RLIMIT
+/// raise. When saturated, `handle` fails fast with 503 + Retry-After: CC/Codex
+/// retry transparently, unlike a dropped connect that kills the user's turn.
+/// Overridable via HEADROOM_INTERCEPT_MAX_INFLIGHT.
+const DEFAULT_MAX_INFLIGHT: usize = 512;
+
+static BACKEND_INFLIGHT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::OnceLock::new();
+
+fn backend_inflight() -> &'static Arc<tokio::sync::Semaphore> {
+    BACKEND_INFLIGHT.get_or_init(|| {
+        let cap = std::env::var("HEADROOM_INTERCEPT_MAX_INFLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_MAX_INFLIGHT);
+        Arc::new(tokio::sync::Semaphore::new(cap))
+    })
+}
 
 /// Dedicated Codex subscription-usage endpoint (ChatGPT OAuth/session auth).
 /// Current Codex no longer ships `x-codex-*` on the `/responses` handshake, so
@@ -44,6 +70,44 @@ const CODEX_USAGE_POLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Epoch-seconds of the last usage-poll attempt; throttles the fire-and-forget
 /// GET to at most one per `CODEX_USAGE_POLL_MIN_INTERVAL_SECS`.
 static CODEX_USAGE_LAST_POLL: AtomicU64 = AtomicU64::new(0);
+
+/// Epoch-seconds of the last time the Python backend delivered response bytes
+/// through this intercept. Stamped by `StampReader` on every backend->client
+/// read; consumed by the watchdog to distinguish a busy backend (streams still
+/// flowing, event loop alive) from a wedged one before force-killing it.
+/// Direct-to-Anthropic bypass paths never stamp, so bypassed traffic can't
+/// mask a dead backend.
+static BACKEND_LAST_TRAFFIC_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// True when the backend delivered response bytes within `window`.
+pub fn backend_traffic_within(window: Duration) -> bool {
+    let last = BACKEND_LAST_TRAFFIC_EPOCH.load(Ordering::Acquire);
+    last != 0 && now_epoch_secs().saturating_sub(last) <= window.as_secs()
+}
+
+fn stamp_backend_traffic() {
+    BACKEND_LAST_TRAFFIC_EPOCH.store(now_epoch_secs(), Ordering::Release);
+}
+
+/// AsyncRead wrapper that stamps `BACKEND_LAST_TRAFFIC_EPOCH` whenever the
+/// inner reader yields bytes. Wrapped around the backend->client half of the
+/// splices below.
+struct StampReader<R>(R);
+
+impl<R: AsyncRead + Unpin> AsyncRead for StampReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.0).poll_read(cx, buf);
+        if matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            stamp_backend_traffic();
+        }
+        poll
+    }
+}
 
 /// Shared state written by the intercept layer.
 pub type SharedToken = Arc<Mutex<Option<BearerToken>>>;
@@ -94,50 +158,66 @@ pub fn spawn(
                 .expect("proxy intercept runtime");
             rt.block_on(async move {
                 let bind_addr: SocketAddr = ([127, 0, 0, 1], INTERCEPT_PORT).into();
-                match run(
-                    bind_addr,
-                    token_slot,
-                    codex_slot,
-                    codex_plan_slot,
-                    bypass,
-                    claude_only_bypass,
-                    codex_bypass,
-                    fresh_bearer_tx,
-                    upstream_base,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                        // Port is already bound. If /health responds over HTTP, an
-                        // existing Headroom proxy owns the port (single-instance
-                        // plugin should normally prevent this, but a crashed or
-                        // still-exiting prior process can leave it held). Treat
-                        // that as benign. Otherwise the port is foreign and we
-                        // escalate to Sentry.
-                        if probe_existing_intercept().await {
-                            log::info!(
-                                "[proxy_intercept] port {INTERCEPT_PORT} already owned by existing Headroom proxy; exiting thread"
-                            );
-                        } else {
-                            log::debug!(
-                                "[proxy_intercept] fatal: {e} (port {INTERCEPT_PORT} held by foreign process)"
-                            );
-                            sentry::capture_message(
-                                &format!(
-                                    "proxy_intercept fatal error: {e} (port {INTERCEPT_PORT} held by foreign process)"
-                                ),
-                                sentry::Level::Fatal,
-                            );
+                // The intercept is the app's front door: client configs point
+                // all traffic at this port, so a bind failure must never end
+                // the thread permanently — the squatter (a crashed prior
+                // instance mid-exit, or a foreign process) may release the
+                // port at any time, and giving up strands every client on a
+                // dead endpoint with no recovery until app relaunch. Retry
+                // forever; report each distinct error to Sentry once.
+                let mut reported_errors: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                loop {
+                    match run(
+                        bind_addr,
+                        token_slot.clone(),
+                        codex_slot.clone(),
+                        codex_plan_slot.clone(),
+                        bypass.clone(),
+                        claude_only_bypass.clone(),
+                        codex_bypass.clone(),
+                        fresh_bearer_tx.clone(),
+                        upstream_base.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => return,
+                        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                            // If /health responds over HTTP, an existing
+                            // Headroom proxy owns the port (single-instance
+                            // plugin should normally prevent this, but a
+                            // crashed or still-exiting prior process can leave
+                            // it held) — benign, just wait for it to go away.
+                            // Otherwise the port is foreign; escalate once.
+                            if probe_existing_intercept().await {
+                                log::info!(
+                                    "[proxy_intercept] port {INTERCEPT_PORT} owned by existing Headroom proxy; retrying in 15s"
+                                );
+                            } else {
+                                log::warn!(
+                                    "[proxy_intercept] port {INTERCEPT_PORT} held by foreign process; retrying in 15s ({e})"
+                                );
+                                if reported_errors.insert(format!("foreign:{e}")) {
+                                    sentry::capture_message(
+                                        &format!(
+                                            "proxy_intercept bind failed: {e} (port {INTERCEPT_PORT} held by foreign process; retrying)"
+                                        ),
+                                        sentry::Level::Error,
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("[proxy_intercept] error: {e}; retrying in 15s");
+                            if reported_errors.insert(e.to_string()) {
+                                sentry::capture_message(
+                                    &format!("proxy_intercept error: {e} (retrying)"),
+                                    sentry::Level::Error,
+                                );
+                            }
                         }
                     }
-                    Err(e) => {
-                        log::debug!("[proxy_intercept] fatal: {e}");
-                        sentry::capture_message(
-                            &format!("proxy_intercept fatal error: {e}"),
-                            sentry::Level::Fatal,
-                        );
-                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                 }
             });
         })
@@ -248,9 +328,30 @@ async fn handle(
     // Whether this is a Codex (OpenAI-path) request. Parsed once here and
     // reused for the Codex plan capture, the Codex-only bypass, and the
     // response-head sniff below.
-    let is_codex = find_header_end(&buf)
-        .and_then(|end| parse_request_head(&buf[..end + 4]))
+    let parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
+    let is_codex = parsed_head
+        .as_ref()
         .is_some_and(|head| is_openai_path(&head.path));
+
+    // Codex fetches its model catalog via `GET <base_url>/models` and caches it
+    // in ~/.codex/models_cache.json. When OpenAI serves `use_responses_lite:
+    // true` for a model, Codex switches to the "responses lite" transport,
+    // which OpenAI rejects for proxied traffic ("This model is not supported
+    // when using X-OpenAI-Internal-Codex-Responses-Lite", enforcement tightened
+    // 2026-06-26). Detect the catalog fetch here so the response splice below
+    // can force the flag to false, keeping Codex on the full Responses path —
+    // which works through the proxy.
+    let is_models_fetch = parsed_head.as_ref().is_some_and(|head| {
+        head.method.eq_ignore_ascii_case("GET")
+            && (head.path == "/v1/models" || head.path.starts_with("/v1/models?"))
+    })
+        // `/v1/models` exists on both providers, so the path alone can't
+        // attribute the fetch. Claude Code always sends Anthropic request
+        // markers; Codex never does. Without this gate every Anthropic
+        // catalog fetch paid the buffering / re-serialization / Sentry-warning
+        // cost of a rewrite that only exists for Codex.
+        && !request_has_header(&buf, "anthropic-version")
+        && !request_has_header(&buf, "x-api-key");
 
     // Scan headers for a Bearer token and capture it. When the token's
     // value differs from what was previously in the slot — or the slot was
@@ -259,17 +360,21 @@ async fn handle(
     // identity with headroom-web. The send is non-blocking; the actual
     // OAuth-profile fetch happens off the request hot path.
     if let Some(token) = extract_bearer(&buf) {
-        let changed = bearer_value_changed(&token_slot, &token);
         // For Codex requests the bearer is an OpenAI OAuth JWT carrying the
-        // ChatGPT plan; decode it so the Codex gate can recommend a tier.
+        // ChatGPT plan; decode it so the Codex gate can recommend a tier. It
+        // must never land in the Claude bearer slot: pricing would send it to
+        // Anthropic's OAuth profile/usage endpoints (cross-provider credential
+        // transmission) where it only earns 401s.
         if is_codex {
             if let Some(tier) = decode_codex_plan_tier(&token) {
                 *codex_plan_slot.lock() = Some(tier);
             }
-        }
-        *token_slot.lock() = Some(BearerToken::new(token));
-        if changed {
-            let _ = fresh_bearer_tx.send(());
+        } else {
+            let changed = bearer_value_changed(&token_slot, &token);
+            *token_slot.lock() = Some(BearerToken::new(token));
+            if changed {
+                let _ = fresh_bearer_tx.send(());
+            }
         }
     }
 
@@ -317,12 +422,37 @@ async fn handle(
         return;
     }
 
+    // Bound concurrent backend forwards. The bypass/direct paths above return
+    // before this point, so only backend-bound traffic is throttled. When the
+    // permit pool is exhausted, fail fast with 503 + Retry-After instead of
+    // connecting and holding another FD pair — a client that gets an immediate
+    // 503 retries transparently; a hung/dropped connect kills the turn. The
+    // permit is held in `_permit` until `handle` returns (through the splice).
+    let Ok(_permit) = backend_inflight().clone().try_acquire_owned() else {
+        log::warn!("[proxy_intercept] backend in-flight cap reached; returning 503");
+        let _ = client
+            .write_all(
+                b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+        return;
+    };
+
     // Forward to the headroom backend.
     let Ok(mut backend) = TcpStream::connect(backend_addr).await else {
-        // headroom not up yet — send a 502 so the client gets a clean error.
-        let _ = client
-            .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            .await;
+        // Backend down or mid-restart (crash, gate transition, post-update
+        // cold boot — which deliberately holds the bypass flags off for up to
+        // 10 minutes): fall back per-request to the native provider instead
+        // of a bare 502, so in-flight Claude Code / Codex sessions keep
+        // working, merely unoptimized and unmetered, until the watchdog
+        // brings the backend back. A deliberately-stopped backend (pricing
+        // gate) never reaches here — the bypass branches above handle it.
+        // `forward_direct_to_anthropic` routes OpenAI paths to
+        // OPENAI_DIRECT_BASE, so Codex degrades identically to Claude.
+        // info, not warn: warn would ship to Sentry per request; the watchdog's
+        // capture_watchdog_give_up already reports genuine down episodes.
+        log::info!("backend {backend_addr} unreachable; forwarding request direct to provider");
+        forward_direct_to_anthropic(client, buf, &upstream_base).await;
         return;
     };
 
@@ -337,6 +467,14 @@ async fn handle(
         stamp_codex_client_header(&mut buf);
     }
 
+    // Force one request per connection so every request gets the full
+    // interception path above — see force_connection_close. WebSocket
+    // handshakes are exempt: the upgrade needs `Connection: Upgrade`, and an
+    // upgraded socket carries no further HTTP request heads to miss.
+    if !request_has_header(&buf, "upgrade") {
+        force_connection_close(&mut buf);
+    }
+
     if backend.write_all(&buf).await.is_err() {
         return;
     }
@@ -348,12 +486,220 @@ async fn handle(
     // response path that sees those headers. Every other client (Claude) keeps
     // the untouched zero-copy splice.
     if is_codex {
-        let req_path = parse_request_head(&buf)
-            .map(|p| p.path)
-            .unwrap_or_default();
+        let req_path = parse_request_head(&buf).map(|p| p.path).unwrap_or_default();
         splice_with_codex_capture(client, backend, &codex_slot, &req_path).await;
+    } else if is_models_fetch {
+        splice_with_models_lite_rewrite(client, backend).await;
     } else {
+        // Same shape as copy_bidirectional, split so the backend->client half
+        // can stamp traffic liveness for the watchdog.
+        let (mut client_rd, mut client_wr) = client.split();
+        let (backend_rd, mut backend_wr) = backend.split();
+        let upstream = async {
+            let _ = tokio::io::copy(&mut client_rd, &mut backend_wr).await;
+            let _ = backend_wr.shutdown().await;
+        };
+        let downstream = async {
+            let mut stamped = StampReader(backend_rd);
+            let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
+            let _ = client_wr.shutdown().await;
+        };
+        tokio::join!(upstream, downstream);
+    }
+}
+
+/// Upper bound on a `/v1/models` response body we're willing to buffer for the
+/// lite-flag rewrite. Real model catalogs are a few KB.
+const MAX_MODELS_BODY: usize = 2 * 1024 * 1024;
+const MODELS_BODY_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Splice client <-> backend for a Codex `GET /v1/models` catalog fetch,
+/// rewriting `"use_responses_lite": true` to `false` in the JSON response so
+/// Codex stays on the full Responses transport (the lite transport is rejected
+/// by OpenAI when re-originated by a proxy). Fail-open: on non-200, compressed
+/// or chunked bodies, oversize payloads, truncated reads, or non-JSON content,
+/// the response is forwarded byte-for-byte untouched.
+async fn splice_with_models_lite_rewrite(mut client: TcpStream, mut backend: TcpStream) {
+    let mut head = Vec::with_capacity(4096);
+    let read_head = tokio::time::timeout(
+        HEADER_READ_TIMEOUT,
+        read_http_headers(&mut backend, &mut head),
+    )
+    .await;
+    if !matches!(read_head, Ok(Ok(()))) {
+        if !head.is_empty() && client.write_all(&head).await.is_err() {
+            return;
+        }
         let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+        return;
+    }
+
+    // `read_http_headers` may over-read leading body bytes past the terminator.
+    let head_end = find_header_end(&head).map(|e| e + 4).unwrap_or(head.len());
+    let status = parse_response_status(&head);
+    let content_length =
+        extract_header_value(&head, "content-length").and_then(|v| v.parse::<usize>().ok());
+    let compressed = extract_header_value(&head, "content-encoding").is_some();
+    let rewritable = matches!(status, Some(200))
+        && !compressed
+        && content_length.is_some_and(|n| n <= MAX_MODELS_BODY);
+
+    if rewritable {
+        let total = content_length.unwrap_or(0);
+        let mut body = head.split_off(head_end);
+        while body.len() < total {
+            let mut tmp = [0u8; 4096];
+            match tokio::time::timeout(MODELS_BODY_READ_TIMEOUT, backend.read(&mut tmp)).await {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => body.extend_from_slice(&tmp[..n]),
+            }
+        }
+        // Bytes past `total` belong to the next keep-alive response.
+        let extra = if body.len() > total {
+            body.split_off(total)
+        } else {
+            Vec::new()
+        };
+        if body.len() == total {
+            match rewrite_use_responses_lite(&body) {
+                ModelsRewrite::Rewritten {
+                    body: rewritten,
+                    flags_flipped,
+                } => {
+                    set_response_content_length(&mut head, rewritten.len());
+                    body = rewritten;
+                    // Normal operation, not a signal: at Info this still went
+                    // to Sentry via capture_message and became the project's
+                    // highest-volume issue (RUST-4M, ~750 events/14d). Local
+                    // log only; the warning variants below still report.
+                    log::info!(
+                        "codex models rewrite applied: flipped {flags_flipped} use_responses_lite flag(s)"
+                    );
+                }
+                ModelsRewrite::Unchanged => {}
+                ModelsRewrite::Unparseable => {
+                    report_models_rewrite(
+                        "unparseable_json",
+                        sentry::Level::Warning,
+                        &format!("200 models response, {} bytes, not JSON", body.len()),
+                    );
+                }
+            }
+        } else {
+            report_models_rewrite(
+                "truncated_body",
+                sentry::Level::Warning,
+                &format!("read {} of {total} body bytes", body.len()),
+            );
+        }
+        for part in [&head, &body, &extra] {
+            if !part.is_empty() && client.write_all(part).await.is_err() {
+                return;
+            }
+        }
+    } else {
+        // A 200 catalog we could not inspect means an affected user silently
+        // keeps `use_responses_lite: true` — exactly the failure this rewrite
+        // exists to prevent, so surface it. Non-200s are routine (auth errors,
+        // upstream hiccups) and already covered by client-side retries.
+        if status == Some(200) {
+            let reason = if compressed {
+                "compressed"
+            } else if content_length.is_none() {
+                "no_content_length"
+            } else {
+                "oversize"
+            };
+            report_models_rewrite(
+                reason,
+                sentry::Level::Warning,
+                &format!("200 models response skipped (content_length={content_length:?})"),
+            );
+        }
+        if client.write_all(&head).await.is_err() {
+            return;
+        }
+    }
+    // Remainder: body of a non-rewritable response and/or keep-alive reuse.
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut backend).await;
+}
+
+/// Outcome of attempting the lite-flag rewrite on a models-catalog body.
+enum ModelsRewrite {
+    /// Body is not JSON (or re-serialization failed) — forwarded untouched.
+    Unparseable,
+    /// Valid JSON with no `use_responses_lite: true` — forwarded untouched.
+    Unchanged,
+    /// One or more flags flipped; `body` is the re-serialized payload.
+    Rewritten { body: Vec<u8>, flags_flipped: usize },
+}
+
+/// Force every `use_responses_lite: true` in a models-catalog JSON payload to
+/// `false`.
+fn rewrite_use_responses_lite(body: &[u8]) -> ModelsRewrite {
+    fn force_false(v: &mut serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Object(map) => {
+                let mut flipped = 0;
+                for (key, val) in map.iter_mut() {
+                    if key == "use_responses_lite" && *val == serde_json::Value::Bool(true) {
+                        *val = serde_json::Value::Bool(false);
+                        flipped += 1;
+                    } else {
+                        flipped += force_false(val);
+                    }
+                }
+                flipped
+            }
+            serde_json::Value::Array(items) => items.iter_mut().map(force_false).sum(),
+            _ => 0,
+        }
+    }
+
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return ModelsRewrite::Unparseable;
+    };
+    let flags_flipped = force_false(&mut value);
+    if flags_flipped == 0 {
+        return ModelsRewrite::Unchanged;
+    }
+    match serde_json::to_vec(&value) {
+        Ok(body) => ModelsRewrite::Rewritten {
+            body,
+            flags_flipped,
+        },
+        Err(_) => ModelsRewrite::Unparseable,
+    }
+}
+
+/// Report a models-rewrite event to Sentry. `kind` is one of `applied`,
+/// `unparseable_json`, `truncated_body`, `compressed`, `no_content_length`,
+/// `oversize` — fingerprinted per kind so each failure class is its own issue
+/// (mirrors report_codex_upstream_error's grouping rationale).
+fn report_models_rewrite(kind: &str, level: sentry::Level, detail: &str) {
+    sentry::with_scope(
+        |scope| {
+            scope.set_tag("models_rewrite", kind);
+            scope.set_extra("detail", detail.to_string().into());
+            scope.set_fingerprint(Some(&["codex-models-rewrite", kind]));
+        },
+        || {
+            sentry::capture_message(&format!("codex models rewrite {kind}: {detail}"), level);
+        },
+    );
+}
+
+/// Replace (or insert) the `Content-Length` header in a response head after a
+/// body rewrite changed its size. `head` must end with the `\r\n\r\n`
+/// terminator and contain no body bytes.
+fn set_response_content_length(head: &mut Vec<u8>, len: usize) {
+    strip_request_header(head, "content-length");
+    if let Some(end) = find_header_end(head) {
+        let insert_at = end + 2;
+        head.splice(
+            insert_at..insert_at,
+            format!("Content-Length: {len}\r\n").into_bytes(),
+        );
     }
 }
 
@@ -388,42 +734,40 @@ async fn splice_with_codex_capture(
         .await;
 
         if matches!(read_head, Ok(Ok(()))) {
+            stamp_backend_traffic();
             if let Some(snapshot) = parse_codex_rate_limit_headers(&head) {
                 *codex_slot.lock() = Some(snapshot);
             }
         }
 
-        // On an upstream error status, buffer one bounded chunk of the error
-        // body for a Sentry report. Codex error responses are small JSON (not
-        // the SSE stream), so this never delays the streaming happy path — that
-        // path takes the `else` and is byte-for-byte identical to before.
+        // Forward the head bytes we read first (full head on success, partial
+        // on timeout/EOF — `read_http_headers` may also include leading body
+        // bytes it over-read). The error-body peek below must never sit in
+        // front of this write: it used to delay the client's status line by up
+        // to 3s when the backend dallied after the head.
+        if client_wr.write_all(&head).await.is_err() {
+            return;
+        }
+        // On an upstream error status, peek one bounded chunk of the error
+        // body for a Sentry report and forward it immediately. Codex error
+        // responses are small JSON (not the SSE stream), so the streaming
+        // happy path never takes this branch.
         if let Some(status) = parse_response_status(&head).filter(is_reportable_codex_error) {
             let mut chunk = vec![0u8; MAX_ERROR_BODY];
-            let n = match tokio::time::timeout(
-                ERROR_BODY_READ_TIMEOUT,
-                backend_rd.read(&mut chunk),
-            )
-            .await
+            let n = match tokio::time::timeout(ERROR_BODY_READ_TIMEOUT, backend_rd.read(&mut chunk))
+                .await
             {
                 Ok(Ok(n)) => n,
                 _ => 0,
             };
             chunk.truncate(n);
-            report_codex_upstream_error(status, req_path, &head, &chunk);
-            // Forward head + the chunk we peeked, then splice any remainder.
-            if client_wr.write_all(&head).await.is_err() {
-                return;
-            }
             if client_wr.write_all(&chunk).await.is_err() {
                 return;
             }
-        } else if client_wr.write_all(&head).await.is_err() {
-            // Forward the head bytes we read (full head on success, partial on
-            // timeout/EOF — `read_http_headers` may also include leading body
-            // bytes it over-read), then splice the rest of the response through.
-            return;
+            report_codex_upstream_error(status, req_path, &head, &chunk);
         }
-        let _ = tokio::io::copy(&mut backend_rd, &mut client_wr).await;
+        let mut stamped = StampReader(backend_rd);
+        let _ = tokio::io::copy(&mut stamped, &mut client_wr).await;
         let _ = client_wr.shutdown().await;
     };
 
@@ -451,7 +795,9 @@ fn is_reportable_codex_error(status: &u16) -> bool {
 }
 
 /// Report a Codex upstream error to Sentry with the status, request path and a
-/// truncated error body (head's over-read body bytes + the peeked chunk).
+/// structural summary of the error body (never the raw body: OpenAI 400s
+/// frequently echo request fields, so raw attachment would leak prompt
+/// fragments into Sentry).
 fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: &[u8]) {
     let head_body = find_header_end(head)
         .map(|e| &head[(e + 4).min(head.len())..])
@@ -459,8 +805,21 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
     let mut body: Vec<u8> = Vec::with_capacity(head_body.len() + chunk.len());
     body.extend_from_slice(head_body);
     body.extend_from_slice(chunk);
-    let snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
+    let snippet = codex_error_summary(&body);
     let path = req_path.to_string();
+    // The raw body stays on-device: the local log keeps full debugging detail
+    // (OpenAI 400s often quote request fields, so only the structural summary
+    // above may leave the machine via Sentry).
+    let raw_snippet: String = String::from_utf8_lossy(&body).chars().take(2000).collect();
+    log::warn!("codex upstream error {status} on {path}: {raw_snippet}");
+    // Upstream 5xx is a provider-side transient (502/503/504/500 proxy_error)
+    // that Headroom neither caused nor can fix. Capturing every one just burns
+    // Sentry quota (RUST-46/4G/4T were all this). Keep full detail in the local
+    // log::warn! above; only forward non-5xx classes (4xx auth/challenge, novel
+    // statuses) that can indicate an actionable request-construction bug.
+    if (500..600).contains(&status) {
+        return;
+    }
     // Group by status so each upstream failure class is its own Sentry issue.
     // Without an explicit fingerprint, Sentry parameterizes the message
     // ("codex upstream error {status} on {path}") and collapses 401 noise, 403
@@ -481,6 +840,31 @@ fn report_codex_upstream_error(status: u16, req_path: &str, head: &[u8], chunk: 
             );
         },
     );
+}
+
+/// Reduce an upstream error body to structural fields safe for Sentry:
+/// `error.type` / `error.code` / `error.param`, never free-text (the
+/// `message` field and raw bodies can quote request content).
+fn codex_error_summary(body: &[u8]) -> String {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(json) => {
+            let err = json.get("error").unwrap_or(&json);
+            let field = |key: &str| {
+                err.get(key)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            format!(
+                "type={} code={} param={}",
+                field("type"),
+                field("code"),
+                field("param")
+            )
+        }
+        // Truncated (peek is bounded) or non-JSON body — report size only.
+        Err(_) => format!("unparseable error body ({} bytes)", body.len()),
+    }
 }
 
 /// Parse the `x-codex-*` rate-limit headers out of a raw HTTP response head
@@ -780,6 +1164,15 @@ static UPSTREAM_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLo
 fn upstream_client() -> &'static reqwest::Client {
     UPSTREAM_CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            // Connect timeout only — no overall timeout, since bypassed SSE
+            // streams legitimately run for minutes. Without it, a
+            // SYN-blackholed network hangs every bypass request until the
+            // client's own deadline.
+            .connect_timeout(std::time::Duration::from_secs(10))
+            // reqwest honors HTTP(S)_PROXY env vars by default, which would
+            // silently route "direct to provider" traffic through a corporate
+            // proxy the intercept path never uses.
+            .no_proxy()
             .build()
             .expect("reqwest client for bypass forwarder")
     })
@@ -838,13 +1231,61 @@ async fn forward_direct_to_anthropic(
         upstream_base
     };
 
+    let header_value = |name: &str| {
+        parsed
+            .headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+
+    // A WebSocket/upgrade handshake needs its own path: Upgrade/Connection are
+    // hop-by-hop for the plain forward below, and Codex's current transport is
+    // WS on /v1/responses — a 501 here would hard-break Codex in exactly the
+    // bypass modes meant to keep it alive. Tunnel the upgrade via hyper's
+    // connection takeover instead.
+    if header_value("upgrade").is_some() {
+        let url = format!("{}{}", effective_base, parsed.path);
+        tunnel_upgrade_direct(client, &parsed, leftover_body, &url).await;
+        return;
+    }
+
+    // A chunked body can't be reassembled here — body reading below tracks
+    // Content-Length only, so forwarding would silently truncate the request.
+    // The CLI clients always send Content-Length; answer 411 honestly for
+    // anything that doesn't.
+    if parsed.content_length.is_none()
+        && header_value("transfer-encoding")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+    {
+        let _ = client
+            .write_all(b"HTTP/1.1 411 Length Required\r\nContent-Length: 0\r\n\r\n")
+            .await;
+        return;
+    }
+
+    // An `Expect: 100-continue` client holds the body back until it sees the
+    // interim response — without this it deadlocks against our body read
+    // below until one side times out.
+    if header_value("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+        && client
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .is_err()
+    {
+        return;
+    }
+
     let body = match parsed.content_length {
         Some(total) if total > leftover_body.len() => {
             let mut body = Vec::with_capacity(total);
             body.extend_from_slice(leftover_body);
             let mut remaining = vec![0u8; total - leftover_body.len()];
-            if client.read_exact(&mut remaining).await.is_err() {
-                return;
+            // Timeout like every other socket read in this file — a client
+            // that stalls mid-body must not pin this task forever.
+            match tokio::time::timeout(BODY_READ_TIMEOUT, client.read_exact(&mut remaining)).await {
+                Ok(Ok(_)) => {}
+                _ => return,
             }
             body.extend_from_slice(&remaining);
             body
@@ -927,6 +1368,93 @@ async fn forward_direct_to_anthropic(
         }
     }
     let _ = client.write_all(b"0\r\n\r\n").await;
+}
+
+/// Tunnel a WebSocket/upgrade handshake to the upstream through the shared
+/// reqwest client. hyper keeps the connection on a 101 and hands it over via
+/// `Response::upgrade()`, after which both sockets are spliced verbatim. Used
+/// by the bypass forwarder so gated/bypassed Codex WS sessions keep working.
+async fn tunnel_upgrade_direct(
+    mut client: TcpStream,
+    parsed: &ParsedRequestHead,
+    leftover: &[u8],
+    url: &str,
+) {
+    let method = match reqwest::Method::from_bytes(parsed.method.as_bytes()) {
+        Ok(m) => m,
+        Err(_) => {
+            let _ = client
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+
+    let mut req = upstream_client().request(method, url);
+    for (name, value) in &parsed.headers {
+        // Unlike the plain forward, Connection/Upgrade/Sec-WebSocket-* must
+        // survive: hyper needs the upgrade intent to keep the connection for
+        // takeover. Only strip what we rewrite ourselves.
+        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("accept-encoding") {
+            continue;
+        }
+        req = req.header(name, value);
+    }
+
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("proxy_intercept bypass upgrade forward failed: {e}");
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+
+    let status = resp.status();
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\n",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("")
+    );
+    for (name, value) in resp.headers().iter() {
+        if name.as_str().eq_ignore_ascii_case("transfer-encoding") {
+            continue;
+        }
+        if let Ok(v) = value.to_str() {
+            head.push_str(&format!("{}: {}\r\n", name.as_str(), v));
+        }
+    }
+    head.push_str("\r\n");
+
+    if status != reqwest::StatusCode::SWITCHING_PROTOCOLS {
+        // Handshake refused — relay the upstream's verdict and close.
+        let body = resp.bytes().await.unwrap_or_default();
+        if client.write_all(head.as_bytes()).await.is_ok() {
+            let _ = client.write_all(&body).await;
+        }
+        return;
+    }
+
+    let mut upstream = match resp.upgrade().await {
+        Ok(u) => u,
+        Err(e) => {
+            log::warn!("proxy_intercept bypass upgrade takeover failed: {e}");
+            let _ = client
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return;
+        }
+    };
+    if client.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    // Frames the client sent before the handshake completed.
+    if !leftover.is_empty() && upstream.write_all(leftover).await.is_err() {
+        return;
+    }
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
 }
 
 struct ParsedRequestHead {
@@ -1109,6 +1637,31 @@ fn strip_request_header(buf: &mut Vec<u8>, name: &str) {
     }
 }
 
+/// Rewrite the request head to `Connection: close` so the backend closes the
+/// connection after one response (and echoes the header, so the client opens
+/// a fresh connection for its next request instead of reusing this one).
+///
+/// Everything this proxy does per request — origin check, bearer capture,
+/// lite-header strip, `X-Client: codex` stamp — is applied only to the first
+/// request head on a connection; after that the socket is an opaque splice,
+/// so a keep-alive reuse would carry a second request past all of it. One
+/// request per connection makes the interception complete by construction,
+/// at the cost of a loopback TCP handshake per request. No-op if the header
+/// terminator is missing.
+fn force_connection_close(buf: &mut Vec<u8>) {
+    if find_header_end(buf).is_none() {
+        return;
+    }
+    while request_has_header(buf, "connection") {
+        strip_request_header(buf, "connection");
+    }
+    let Some(end) = find_header_end(buf) else {
+        return;
+    };
+    let insert_at = end + 2;
+    buf.splice(insert_at..insert_at, *b"Connection: close\r\n");
+}
+
 /// Insert `X-Client: codex` into a request head so the Python backend's
 /// `classify_client` identifies Codex traffic even when the client's
 /// User-Agent isn't `codex-cli/` (e.g. the Codex GUI/IDE). A client that
@@ -1205,8 +1758,12 @@ fn host_is_loopback(host: &str) -> bool {
 }
 
 /// Extract the bearer token value from raw HTTP request bytes, if present.
+/// Only the header block is scanned: `read_http_headers` over-reads, so `buf`
+/// can carry the start of the body, and body bytes must never be able to
+/// plant an Authorization line that poisons the captured token.
 fn extract_bearer(buf: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(buf).ok()?;
+    let end = find_header_end(buf).unwrap_or(buf.len());
+    let text = std::str::from_utf8(&buf[..end]).ok()?;
     for line in text.lines() {
         let lower = line.to_ascii_lowercase();
         if let Some(rest) = lower.strip_prefix("authorization:") {
@@ -1225,13 +1782,14 @@ fn extract_bearer(buf: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bearer_value_changed, codex_snapshot_from_usage_payload, codex_window_label,
-        decode_codex_plan_tier, extract_bearer, extract_header_value, find_header_end,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_openai_path, parse_codex_rate_limit_headers, parse_request_head, read_http_headers,
-        is_reportable_codex_error, parse_response_status, request_has_header,
-        request_is_loopback_safe, run, stamp_codex_client_header, strip_request_header, BypassFlag,
-        SharedToken,
+        bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
+        codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
+        find_header_end, is_hop_by_hop_request_header, is_hop_by_hop_response_header,
+        is_local_proxy_path, is_openai_path, is_reportable_codex_error,
+        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
+        read_http_headers, request_has_header, request_is_loopback_safe,
+        rewrite_use_responses_lite, run, set_response_content_length, stamp_codex_client_header,
+        strip_request_header, BypassFlag, ModelsRewrite, SharedToken,
     };
     use crate::backend_port;
     use crate::bearer::BearerToken;
@@ -1245,6 +1803,35 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    #[serial]
+    fn backend_traffic_window_tracks_stamps() {
+        use std::sync::atomic::Ordering;
+        super::BACKEND_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
+        assert!(!super::backend_traffic_within(Duration::from_secs(10)));
+        super::stamp_backend_traffic();
+        assert!(super::backend_traffic_within(Duration::from_secs(10)));
+        super::BACKEND_LAST_TRAFFIC_EPOCH.store(
+            super::now_epoch_secs().saturating_sub(11),
+            Ordering::Release,
+        );
+        assert!(!super::backend_traffic_within(Duration::from_secs(10)));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stamp_reader_stamps_on_backend_bytes() {
+        use std::sync::atomic::Ordering;
+        super::BACKEND_LAST_TRAFFIC_EPOCH.store(0, Ordering::Release);
+        let (mut writer, backend_side) = duplex(64);
+        writer.write_all(b"data: chunk\n\n").await.unwrap();
+        let mut reader = super::StampReader(backend_side);
+        let mut buf = [0u8; 32];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(n, 13);
+        assert!(super::backend_traffic_within(Duration::from_secs(10)));
+    }
 
     #[test]
     fn finds_header_boundary() {
@@ -1275,6 +1862,20 @@ mod tests {
     fn extracts_bearer_token_case_insensitively() {
         let request = b"POST / HTTP/1.1\r\nAuthorization: Bearer test-token\r\n\r\n";
         assert_eq!(extract_bearer(request).as_deref(), Some("test-token"));
+    }
+
+    #[test]
+    fn extract_bearer_ignores_authorization_lines_in_the_body() {
+        // read_http_headers over-reads, so the buffer can contain body bytes.
+        // A body line that looks like an Authorization header must not be
+        // captured as a credential.
+        let request = b"POST / HTTP/1.1\r\nContent-Type: text/plain\r\n\r\nAuthorization: Bearer attacker-value\r\n";
+        assert_eq!(extract_bearer(request), None);
+
+        // A real header still wins with body bytes present.
+        let request =
+            b"POST / HTTP/1.1\r\nAuthorization: Bearer real\r\n\r\nAuthorization: Bearer fake\r\n";
+        assert_eq!(extract_bearer(request).as_deref(), Some("real"));
     }
 
     #[test]
@@ -1481,12 +2082,29 @@ mod tests {
 
     #[tokio::test]
     #[serial(backend_port)]
-    async fn intercept_returns_502_when_backend_is_unreachable() {
+    async fn intercept_falls_back_direct_when_backend_is_unreachable() {
         // Pick a backend port that nothing is listening on. Bind+immediately
         // drop a listener to grab a free port, then connect attempts will fail.
         let (probe, dead_backend_addr) = bind_ephemeral().await;
         drop(probe);
         backend_port::set(dead_backend_addr.port());
+
+        // Mock upstream: answers 200 to whatever arrives. API traffic must
+        // land here (per-request direct fallback) instead of getting a 502.
+        let (upstream_listener, upstream_addr) = bind_ephemeral().await;
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
 
         let token_slot: SharedToken = Arc::new(Mutex::new(None));
         let intercept_listener = TcpListener::bind("127.0.0.1:0")
@@ -1496,7 +2114,7 @@ mod tests {
         drop(intercept_listener);
         let slot_for_run = token_slot.clone();
         let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
-        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let upstream_base = Arc::new(format!("http://127.0.0.1:{}", upstream_addr.port()));
         let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
         let run_task = tokio::spawn(async move {
             let _ = run(
@@ -1512,6 +2130,25 @@ mod tests {
             )
             .await;
         });
+
+        let read_response = |mut client: TcpStream| async move {
+            let mut response = Vec::new();
+            let mut tmp = [0u8; 256];
+            let _ = timeout(Duration::from_secs(5), async {
+                loop {
+                    let n = client.read(&mut tmp).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    response.extend_from_slice(&tmp[..n]);
+                    if response.len() >= 16 {
+                        break;
+                    }
+                }
+            })
+            .await;
+            response
+        };
 
         let mut client = None;
         for _ in 0..50 {
@@ -1531,26 +2168,28 @@ mod tests {
             .write_all(request.as_bytes())
             .await
             .expect("write request");
-
-        let mut response = Vec::new();
-        let mut tmp = [0u8; 256];
-        let _ = timeout(Duration::from_secs(2), async {
-            loop {
-                let n = client.read(&mut tmp).await.unwrap_or(0);
-                if n == 0 {
-                    break;
-                }
-                response.extend_from_slice(&tmp[..n]);
-                if response.len() >= 16 {
-                    break;
-                }
-            }
-        })
-        .await;
+        let response = read_response(client).await;
         let response_str = std::str::from_utf8(&response).unwrap_or("");
         assert!(
-            response_str.starts_with("HTTP/1.1 502"),
-            "expected 502 Bad Gateway, got: {response_str:?}"
+            response_str.starts_with("HTTP/1.1 200"),
+            "expected direct-to-upstream 200 fallback, got: {response_str:?}"
+        );
+
+        // Local proxy paths (health probes, stats) must NOT leak upstream on
+        // fallback: the boot-time readyz poll would otherwise flap green and
+        // real probes would generate provider traffic every 250ms.
+        let mut probe_client = TcpStream::connect(intercept_addr)
+            .await
+            .expect("probe connect");
+        probe_client
+            .write_all(b"GET /readyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .expect("write probe");
+        let response = read_response(probe_client).await;
+        let response_str = std::str::from_utf8(&response).unwrap_or("");
+        assert!(
+            response_str.starts_with("HTTP/1.1 503"),
+            "expected local 503 for /readyz on fallback, got: {response_str:?}"
         );
 
         run_task.abort();
@@ -1655,7 +2294,10 @@ mod tests {
     fn strip_request_header_removes_lite_header_and_preserves_body() {
         let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6767\r\nX-OpenAI-Internal-Codex-Responses-Lite: 1\r\nContent-Length: 5\r\n\r\nhello".to_vec();
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
-        assert!(!request_has_header(&buf, "X-OpenAI-Internal-Codex-Responses-Lite"));
+        assert!(!request_has_header(
+            &buf,
+            "X-OpenAI-Internal-Codex-Responses-Lite"
+        ));
         // Surrounding headers, terminator and body intact.
         assert!(request_has_header(&buf, "host"));
         assert!(request_has_header(&buf, "content-length"));
@@ -1668,6 +2310,41 @@ mod tests {
         let mut buf = b"POST /v1/responses HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
         let original = buf.clone();
         strip_request_header(&mut buf, "X-OpenAI-Internal-Codex-Responses-Lite");
+        assert_eq!(buf, original);
+    }
+
+    #[test]
+    fn force_connection_close_replaces_keep_alive_and_preserves_body() {
+        let mut buf =
+            b"POST /v1/messages HTTP/1.1\r\nHost: x\r\nConnection: keep-alive\r\n\r\n{\"a\":1}"
+                .to_vec();
+        super::force_connection_close(&mut buf);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(!text.contains("keep-alive"));
+        assert!(
+            text.ends_with("\r\n\r\n{\"a\":1}"),
+            "body preserved: {text}"
+        );
+        assert_eq!(text.matches("Connection:").count(), 1);
+    }
+
+    #[test]
+    fn force_connection_close_inserts_when_no_connection_header() {
+        let mut buf = b"GET /v1/models HTTP/1.1\r\nHost: x\r\n\r\n".to_vec();
+        super::force_connection_close(&mut buf);
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("Connection: close\r\n"));
+        // Still exactly one header terminator, at the end.
+        assert!(text.ends_with("\r\n\r\n"));
+        assert_eq!(text.matches("\r\n\r\n").count(), 1);
+    }
+
+    #[test]
+    fn force_connection_close_noop_without_terminator() {
+        let mut buf = b"GET / HTTP/1.1\r\nHost: x\r\n".to_vec();
+        let original = buf.clone();
+        super::force_connection_close(&mut buf);
         assert_eq!(buf, original);
     }
 
@@ -2282,5 +2959,312 @@ mod tests {
         assert_eq!(codex_window_label(300), "5h");
         assert_eq!(codex_window_label(10080), "168h");
         assert_eq!(codex_window_label(90), "1h30m");
+    }
+
+    fn expect_rewritten(result: ModelsRewrite) -> (Vec<u8>, usize) {
+        match result {
+            ModelsRewrite::Rewritten {
+                body,
+                flags_flipped,
+            } => (body, flags_flipped),
+            _ => panic!("expected Rewritten"),
+        }
+    }
+
+    #[test]
+    fn rewrite_use_responses_lite_forces_false() {
+        let body = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true},{"slug":"gpt-5.4","use_responses_lite":false}]}"#;
+        let (rewritten, flipped) = expect_rewritten(rewrite_use_responses_lite(body));
+        assert_eq!(flipped, 1);
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        for model in value["models"].as_array().unwrap() {
+            assert_eq!(model["use_responses_lite"], serde_json::Value::Bool(false));
+        }
+        // Other fields survive.
+        assert_eq!(value["models"][0]["slug"], "gpt-5.5");
+    }
+
+    #[test]
+    fn rewrite_use_responses_lite_handles_nested_flag() {
+        let body = br#"{"data":{"items":[{"info":{"use_responses_lite":true}}]}}"#;
+        let (rewritten, flipped) = expect_rewritten(rewrite_use_responses_lite(body));
+        assert_eq!(flipped, 1);
+        let value: serde_json::Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(
+            value["data"]["items"][0]["info"]["use_responses_lite"],
+            serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn rewrite_use_responses_lite_noop_when_nothing_to_change() {
+        // All-false catalog: no rewrite, response stays byte-identical.
+        assert!(matches!(
+            rewrite_use_responses_lite(
+                br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":false}]}"#
+            ),
+            ModelsRewrite::Unchanged
+        ));
+        // Non-boolean value is left alone.
+        assert!(matches!(
+            rewrite_use_responses_lite(br#"{"use_responses_lite":"true"}"#),
+            ModelsRewrite::Unchanged
+        ));
+        // Non-JSON body: fail-open, reported as unparseable.
+        assert!(matches!(
+            rewrite_use_responses_lite(b"<html>challenge</html>"),
+            ModelsRewrite::Unparseable
+        ));
+    }
+
+    #[tokio::test]
+    #[serial(backend_port)]
+    async fn intercept_rewrites_use_responses_lite_in_models_response() {
+        let models_json = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true}]}"#.to_vec();
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            let _ = read_until_header_end(&mut sock).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                models_json.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.write_all(&models_json).await;
+            // Keep the connection open briefly so the splice can finish.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        backend_port::set(backend_addr.port());
+
+        let token_slot: SharedToken = Arc::new(Mutex::new(None));
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let slot_for_run = token_slot.clone();
+        let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
+        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                slot_for_run,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                bypass_for_run,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                upstream_base,
+            )
+            .await;
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(c) = TcpStream::connect(intercept_addr).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("intercept reachable");
+
+        let request = format!(
+            "GET /v1/models?client_version=1.0.0 HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer test-token-123\r\n\r\n",
+            intercept_addr.port()
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+
+        // Read head + body of the (rewritten) response.
+        let mut response = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let mut tmp = [0u8; 4096];
+            let n = match tokio::time::timeout_at(deadline, client.read(&mut tmp)).await {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => n,
+                Ok(Err(_)) => break,
+            };
+            response.extend_from_slice(&tmp[..n]);
+            if let Some(end) = find_header_end(&response) {
+                let head = std::str::from_utf8(&response[..end + 4]).expect("utf8 head");
+                let content_length: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Content-Length: "))
+                    .expect("content-length present")
+                    .trim()
+                    .parse()
+                    .expect("numeric content-length");
+                if response.len() >= end + 4 + content_length {
+                    break;
+                }
+            }
+        }
+
+        let end = find_header_end(&response).expect("response head complete");
+        let body: serde_json::Value =
+            serde_json::from_slice(&response[end + 4..]).expect("json body");
+        assert_eq!(
+            body["models"][0]["use_responses_lite"],
+            serde_json::Value::Bool(false),
+            "lite flag rewritten to false: {body}"
+        );
+        assert_eq!(body["models"][0]["slug"], "gpt-5.5");
+
+        run_task.abort();
+        backend_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    #[tokio::test]
+    #[serial(backend_port)]
+    async fn intercept_skips_models_rewrite_for_anthropic_fetch() {
+        // Same catalog shape, but the request carries Anthropic markers —
+        // the Codex-only lite-flag rewrite must leave it untouched.
+        let models_json = br#"{"models":[{"slug":"gpt-5.5","use_responses_lite":true}]}"#.to_vec();
+        let (backend_listener, backend_addr) = bind_ephemeral().await;
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.expect("backend accept");
+            let _ = read_until_header_end(&mut sock).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                models_json.len()
+            );
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.write_all(&models_json).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        });
+
+        backend_port::set(backend_addr.port());
+
+        let token_slot: SharedToken = Arc::new(Mutex::new(None));
+        let intercept_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("intercept bind");
+        let intercept_addr = intercept_listener.local_addr().expect("intercept addr");
+        drop(intercept_listener);
+        let slot_for_run = token_slot.clone();
+        let bypass_for_run: BypassFlag = Arc::new(AtomicBool::new(false));
+        let upstream_base = Arc::new("https://api.anthropic.com".to_string());
+        let (fresh_bearer_tx, _fresh_bearer_rx) = std::sync::mpsc::channel::<()>();
+        let run_task = tokio::spawn(async move {
+            let _ = run(
+                intercept_addr,
+                slot_for_run,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                bypass_for_run,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                fresh_bearer_tx,
+                upstream_base,
+            )
+            .await;
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            if let Ok(c) = TcpStream::connect(intercept_addr).await {
+                client = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut client = client.expect("intercept reachable");
+
+        let request = format!(
+            "GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nanthropic-version: 2023-06-01\r\n\r\n",
+            intercept_addr.port()
+        );
+        client
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+
+        let mut response = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let _ = timeout(Duration::from_secs(2), async {
+            loop {
+                match client.read(&mut tmp).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        response.extend_from_slice(&tmp[..n]);
+                        if let Some(end) = find_header_end(&response) {
+                            if serde_json::from_slice::<serde_json::Value>(&response[end + 4..])
+                                .is_ok()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        let end = find_header_end(&response).expect("response head complete");
+        let body: serde_json::Value =
+            serde_json::from_slice(&response[end + 4..]).expect("json body");
+        assert_eq!(
+            body["models"][0]["use_responses_lite"],
+            serde_json::Value::Bool(true),
+            "anthropic-marked models fetch must pass through unrewritten: {body}"
+        );
+
+        run_task.abort();
+        backend_task.abort();
+        backend_port::reset_for_tests();
+    }
+
+    #[test]
+    fn codex_error_summary_extracts_structural_fields_only() {
+        let body = br#"{"error":{"message":"Invalid prompt: SECRET user content here","type":"invalid_request_error","param":"messages","code":"invalid_prompt"}}"#;
+        let summary = codex_error_summary(body);
+        assert_eq!(
+            summary,
+            "type=invalid_request_error code=invalid_prompt param=messages"
+        );
+        assert!(
+            !summary.contains("SECRET"),
+            "free-text message must never reach Sentry: {summary}"
+        );
+    }
+
+    #[test]
+    fn codex_error_summary_handles_non_json() {
+        assert_eq!(
+            codex_error_summary(b"<html>gateway error</html>"),
+            "unparseable error body (26 bytes)"
+        );
+    }
+
+    #[test]
+    fn set_response_content_length_replaces_existing() {
+        let mut head =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 10\r\n\r\n"
+                .to_vec();
+        set_response_content_length(&mut head, 12345);
+        let text = String::from_utf8(head).unwrap();
+        assert!(text.contains("Content-Length: 12345\r\n"));
+        assert!(!text.contains("Content-Length: 10\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
+        assert!(text.contains("Content-Type: application/json\r\n"));
+    }
+
+    #[tokio::test]
+    async fn inflight_semaphore_fails_fast_when_exhausted() {
+        // A saturated pool must reject via try_acquire_owned so `handle` takes
+        // the 503 branch instead of connecting and holding another FD pair.
+        let sem = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = sem.clone().try_acquire_owned().expect("first permit");
+        assert!(sem.clone().try_acquire_owned().is_err(), "should be saturated");
+        drop(held);
+        assert!(sem.try_acquire_owned().is_ok(), "permit released on drop");
     }
 }

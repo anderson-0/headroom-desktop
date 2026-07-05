@@ -640,7 +640,7 @@ fn codex_usage_from_snapshot(
         Some(headroom_tier_for_codex_plan(&plan_tier).unwrap_or(HeadroomSubscriptionTier::Pro));
     let weekly_used_percent = snapshot.secondary.as_ref().map(|w| w.used_percent);
 
-    let gate = codex_plan_gate(weekly_used_percent, gate_enabled);
+    let gate = codex_plan_gate(weekly_used_percent, &plan_tier, gate_enabled);
 
     CodexUsage {
         limit_name: snapshot.limit_name,
@@ -655,6 +655,8 @@ fn codex_usage_from_snapshot(
         recommended_subscription_tier,
         weekly_used_percent,
         gate_message: gate.gate_message,
+        effective_nudge_thresholds_percent: gate.nudge_thresholds_percent.to_vec(),
+        effective_disable_threshold_percent: gate.disable_threshold_percent,
     }
 }
 
@@ -664,15 +666,33 @@ struct CodexGate {
     nudge_level: u8,
     gate_reason: Option<PricingGateReason>,
     gate_message: String,
+    nudge_thresholds_percent: [f64; 3],
+    disable_threshold_percent: f64,
 }
 
-/// Codex weekly-usage gate, the Codex-only parallel to `paid_plan_gate`. Uses
-/// the same nudge thresholds and a 50% disable threshold against the weekly
-/// (secondary) window. Enforcement is scoped to Codex traffic via
-/// `AppState::codex_bypass`, so it never pauses Claude optimization.
-fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> CodexGate {
-    let disable = CODEX_WEEKLY_DISABLE_THRESHOLD_PCT;
-    let nudges = NUDGE_THRESHOLDS_PERCENT;
+/// Codex weekly-usage gate, the Codex-only parallel to `paid_plan_gate`.
+/// Tier-dependent, mirroring the Claude ladder: plans that map to a Max-like
+/// Headroom tier (ChatGPT Pro, Team, Business, Enterprise) nudge at 10/15/20%
+/// and pause at 25%; Go/Plus (Pro-like) nudge at 25/35/45% and pause at 50%.
+/// Enforcement is scoped to Codex traffic via `AppState::codex_bypass`, so it
+/// never pauses Claude optimization.
+fn codex_plan_gate(
+    weekly_used_percent: Option<f64>,
+    plan_tier: &CodexPlanTier,
+    gate_enabled: bool,
+) -> CodexGate {
+    let max_like = matches!(
+        crate::models::headroom_tier_for_codex_plan(plan_tier),
+        Some(HeadroomSubscriptionTier::Max5x | HeadroomSubscriptionTier::Max20x)
+    );
+    let (disable, nudges) = if max_like {
+        // Max-like tiers pause at 25%, so nudges sit below that cutoff to
+        // keep the warn-then-pause cadence — same rationale as
+        // MAX_TIER_NUDGE_THRESHOLDS_PERCENT on the Claude side.
+        (25.0, MAX_TIER_NUDGE_THRESHOLDS_PERCENT)
+    } else {
+        (CODEX_WEEKLY_DISABLE_THRESHOLD_PCT, NUDGE_THRESHOLDS_PERCENT)
+    };
 
     let Some(weekly_usage) = weekly_used_percent else {
         return CodexGate {
@@ -683,6 +703,8 @@ fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> Code
             gate_message:
                 "Send a Codex prompt through Headroom to sync your current weekly usage window."
                     .into(),
+            nudge_thresholds_percent: nudges,
+            disable_threshold_percent: disable,
         };
     };
 
@@ -695,6 +717,8 @@ fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> Code
             gate_message: format!(
                 "Codex weekly usage is at {weekly_usage:.0}% of the current window."
             ),
+            nudge_thresholds_percent: nudges,
+            disable_threshold_percent: disable,
         };
     }
 
@@ -707,6 +731,8 @@ fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> Code
             gate_message: format!(
                 "Headroom is paused because you've reached {weekly_usage:.1}% of weekly Codex usage. Upgrade to raise your limit."
             ),
+            nudge_thresholds_percent: nudges,
+            disable_threshold_percent: disable,
         };
     }
 
@@ -727,6 +753,8 @@ fn codex_plan_gate(weekly_used_percent: Option<f64>, gate_enabled: bool) -> Code
         nudge_level,
         gate_reason: None,
         gate_message,
+        nudge_thresholds_percent: nudges,
+        disable_threshold_percent: disable,
     }
 }
 
@@ -994,25 +1022,37 @@ pub fn weekly_limit_signal(status: &HeadroomPricingStatus) -> Option<WeeklyLimit
             Some(PricingGateReason::WeeklyUsageLimitReached)
         );
     if claude_reached {
-        return Some(WeeklyLimitNudge { status: "reached", cap_percent: claude_cap });
+        return Some(WeeklyLimitNudge {
+            status: "reached",
+            cap_percent: claude_cap,
+        });
     }
     let codex_reached = status
         .codex
         .as_ref()
         .is_some_and(|codex| !codex.optimization_allowed);
     if codex_reached {
-        return Some(WeeklyLimitNudge { status: "reached", cap_percent: codex_cap });
+        return Some(WeeklyLimitNudge {
+            status: "reached",
+            cap_percent: codex_cap,
+        });
     }
 
     if status.should_nudge {
-        return Some(WeeklyLimitNudge { status: "approaching", cap_percent: claude_cap });
+        return Some(WeeklyLimitNudge {
+            status: "approaching",
+            cap_percent: claude_cap,
+        });
     }
     let codex_approaching = status
         .codex
         .as_ref()
         .is_some_and(|codex| codex.should_nudge);
     if codex_approaching {
-        return Some(WeeklyLimitNudge { status: "approaching", cap_percent: codex_cap });
+        return Some(WeeklyLimitNudge {
+            status: "approaching",
+            cap_percent: codex_cap,
+        });
     }
     None
 }
@@ -1330,8 +1370,7 @@ fn evaluate_pricing_status_with_mismatch(
                     "Headroom subscription active. Optimization stays fully enabled.".into();
             }
         } else if account.trial_active {
-            gate_message =
-                "Your Headroom trial is active with unlimited optimization.".into();
+            gate_message = "Your Headroom trial is active with unlimited optimization.".into();
         } else {
             match claude.plan_tier {
                 ClaudePlanTier::Free => {
@@ -1470,10 +1509,17 @@ fn resolve_tier_mismatch(
         match account.and_then(|a| detect_tier_mismatch(a, claude, codex_plan)) {
             Some(triple) => triple,
             None => {
-                if let Ok(mut local) = load_or_initialize_local_state() {
-                    if local.mismatch_since.is_some() {
-                        local.mismatch_since = None;
-                        let _ = write_local_state(&local);
+                // Clear the grace clock only on an affirmative "no mismatch"
+                // (account profile present). A failed account fetch also lands
+                // here, and clearing on those used to restart the 14-day clamp
+                // window on every transient blip — one flaky poll per two
+                // weeks meant under-subscribed users were never clamped.
+                if account.is_some() {
+                    if let Ok(mut local) = load_or_initialize_local_state() {
+                        if local.mismatch_since.is_some() {
+                            local.mismatch_since = None;
+                            let _ = write_local_state(&local);
+                        }
                     }
                 }
                 return None;
@@ -2165,10 +2211,20 @@ fn remote_account_to_profile(value: RemoteAccountResponse) -> HeadroomAccountPro
     }
 }
 
+/// Consecutive background polls answered 401. Tolerating a single 401 keeps a
+/// user signed in through server blips, but a *revoked* session answers 401
+/// forever — without an escalation path the app showed "authenticated" with a
+/// permanent confusing banner until reinstall.
+static CONSECUTIVE_UNAUTHORIZED_SYNCS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+const MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS: u32 = 3;
+
 fn merge_background_account_sync(
     session_token: Option<&str>,
     sync_result: Result<RemoteAccountResponse, RemoteAccountSyncError>,
 ) -> (bool, Option<HeadroomAccountProfile>, Option<String>) {
+    use std::sync::atomic::Ordering;
+
     if session_token.is_none() {
         return (false, None, None);
     }
@@ -2177,16 +2233,34 @@ fn merge_background_account_sync(
         // Background polling should not silently drop the locally stored session.
         // Explicit auth-required actions still clear the token if the server says it
         // is expired, but passive refreshes keep the user signed in locally.
-        Ok(account) => (true, Some(remote_account_to_profile(account)), None),
-        Err(RemoteAccountSyncError::Unauthorized) => (
-            true,
-            None,
-            Some("Headroom account connected, but your plan details could not be refreshed. Sign in again if this keeps happening.".into()),
-        ),
+        Ok(account) => {
+            CONSECUTIVE_UNAUTHORIZED_SYNCS.store(0, Ordering::Relaxed);
+            (true, Some(remote_account_to_profile(account)), None)
+        }
+        Err(RemoteAccountSyncError::Unauthorized) => {
+            let unauthorized = CONSECUTIVE_UNAUTHORIZED_SYNCS.fetch_add(1, Ordering::Relaxed) + 1;
+            if unauthorized >= MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS {
+                return (
+                    false,
+                    None,
+                    Some("Your Headroom session has expired. Please sign in again.".into()),
+                );
+            }
+            (
+                true,
+                None,
+                Some("Headroom account connected, but your plan details could not be refreshed. Sign in again if this keeps happening.".into()),
+            )
+        }
+        // Network failures carry no evidence about the session; never count
+        // them toward escalation.
         Err(RemoteAccountSyncError::Other) => (
             true,
             None,
-            Some("Headroom account connected, but your plan details are unavailable right now.".into()),
+            Some(
+                "Headroom account connected, but your plan details are unavailable right now."
+                    .into(),
+            ),
         ),
     }
 }
@@ -2218,9 +2292,11 @@ fn write_local_state(state: &LocalPricingState) -> Result<(), String> {
             )
         })?;
     }
-    std::fs::write(
+    // Atomic: a crash mid-write used to truncate the file, silently resetting
+    // trial/grace clocks on the next load.
+    crate::client_adapters::atomic_write(
         &path,
-        serde_json::to_vec_pretty(state)
+        &serde_json::to_vec_pretty(state)
             .map_err(|err| format!("Failed to serialize pricing state: {err}"))?,
     )
     .map_err(|err| format!("Failed to write pricing state {}: {err}", path.display()))
@@ -2448,7 +2524,8 @@ mod tests {
         resolve_account_api_base_url, ClaudeOauthProfile, ClaudeOauthProfileAccount,
         ClaudeOauthProfileOrganization, HeadroomSubscriptionTier, IdentityFingerprint,
         IdentityPayload, LocalPricingState, PricingPromo, RemoteAccountResponse,
-        RemoteAccountSyncError, DEFAULT_ACCOUNT_API_BASE_URL,
+        RemoteAccountSyncError, CONSECUTIVE_UNAUTHORIZED_SYNCS, DEFAULT_ACCOUNT_API_BASE_URL,
+        MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS,
     };
     use crate::models::{
         BillingPeriod, ClaudeAccountProfile, ClaudeAuthMethod, ClaudePlanTier, CodexPlanTier,
@@ -2865,15 +2942,38 @@ mod tests {
     }
 
     #[test]
-    fn unauthorized_background_sync_keeps_local_session_authenticated() {
-        let (authenticated, account, error) = merge_background_account_sync(
+    #[serial_test::serial(unauth_sync_counter)]
+    fn unauthorized_background_sync_tolerates_blips_then_escalates() {
+        CONSECUTIVE_UNAUTHORIZED_SYNCS.store(0, std::sync::atomic::Ordering::Relaxed);
+
+        // Transient 401s keep the local session authenticated...
+        for _ in 0..(MAX_CONSECUTIVE_UNAUTHORIZED_SYNCS - 1) {
+            let (authenticated, account, error) = merge_background_account_sync(
+                Some("session-token"),
+                Err(RemoteAccountSyncError::Unauthorized),
+            );
+            assert!(authenticated);
+            assert!(account.is_none());
+            assert!(error.is_some());
+        }
+
+        // ...but a revoked session (consecutive 401s) escalates to signed-out.
+        let (authenticated, _, error) = merge_background_account_sync(
             Some("session-token"),
             Err(RemoteAccountSyncError::Unauthorized),
         );
-
-        assert!(authenticated);
-        assert!(account.is_none());
+        assert!(!authenticated);
         assert!(error.is_some());
+
+        // A single success resets the tolerance window.
+        let (authenticated, _, _) =
+            merge_background_account_sync(Some("session-token"), Ok(sample_remote_account()));
+        assert!(authenticated);
+        let (authenticated, _, _) = merge_background_account_sync(
+            Some("session-token"),
+            Err(RemoteAccountSyncError::Unauthorized),
+        );
+        assert!(authenticated);
     }
 
     #[test]
@@ -2889,6 +2989,9 @@ mod tests {
     }
 
     #[test]
+    // Ok resets the unauthorized counter, so keep it off the escalation
+    // test's timeline.
+    #[serial_test::serial(unauth_sync_counter)]
     fn successful_background_sync_returns_remote_account_profile() {
         let (authenticated, account, error) =
             merge_background_account_sync(Some("session-token"), Ok(sample_remote_account()));
@@ -3866,28 +3969,65 @@ mod tests {
 
     #[test]
     fn codex_gate_nudges_then_pauses_for_free_account() {
-        // Below first threshold: no nudge, optimization allowed.
+        // Go/Plus (Pro-like) ladder: nudges 25/35/45, pause at 50.
         let low = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(20.0),
-            crate::models::CodexPlanTier::Pro,
+            crate::models::CodexPlanTier::Plus,
             true,
         );
         assert!(low.optimization_allowed);
         assert_eq!(low.nudge_level, 0);
+        assert_eq!(low.effective_disable_threshold_percent, 50.0);
 
-        // Crossing thresholds escalates the nudge level.
         let mid = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(36.0),
-            crate::models::CodexPlanTier::Pro,
+            crate::models::CodexPlanTier::Plus,
             true,
         );
         assert!(mid.optimization_allowed);
         assert_eq!(mid.nudge_level, 2, "36% crosses the 25% and 35% thresholds");
         assert!(mid.should_nudge);
 
-        // At/over the disable threshold: optimization paused with the Codex reason.
         let over = super::codex_usage_from_snapshot(
             codex_snapshot_with_weekly(50.0),
+            crate::models::CodexPlanTier::Plus,
+            true,
+        );
+        assert!(!over.optimization_allowed);
+        assert!(matches!(
+            over.gate_reason,
+            Some(crate::models::PricingGateReason::CodexWeeklyUsageLimitReached)
+        ));
+    }
+
+    #[test]
+    fn codex_gate_uses_max_ladder_for_max_like_plans() {
+        // ChatGPT Pro maps to Max x20: nudges 10/15/20, pause at 25 — the
+        // same warn-then-pause cadence as Claude Max tiers.
+        let low = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(8.0),
+            crate::models::CodexPlanTier::Pro,
+            true,
+        );
+        assert!(low.optimization_allowed);
+        assert_eq!(low.nudge_level, 0);
+        assert_eq!(low.effective_disable_threshold_percent, 25.0);
+        assert_eq!(
+            low.effective_nudge_thresholds_percent,
+            vec![10.0, 15.0, 20.0]
+        );
+
+        let mid = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(20.0),
+            crate::models::CodexPlanTier::Pro,
+            true,
+        );
+        assert!(mid.optimization_allowed);
+        assert_eq!(mid.nudge_level, 3, "20% crosses all of 10/15/20");
+        assert!(mid.should_nudge);
+
+        let over = super::codex_usage_from_snapshot(
+            codex_snapshot_with_weekly(25.0),
             crate::models::CodexPlanTier::Pro,
             true,
         );
@@ -4505,14 +4645,12 @@ mod tests {
         );
         // Unknown is undecodable, not a confident plan -> no recommendation, so
         // a Pro subscriber with no other signal sees no mismatch nudge.
-        assert!(
-            detect_tier_mismatch(
-                &account,
-                &empty_claude_profile(ClaudePlanTier::Unknown),
-                None,
-            )
-            .is_none()
-        );
+        assert!(detect_tier_mismatch(
+            &account,
+            &empty_claude_profile(ClaudePlanTier::Unknown),
+            None,
+        )
+        .is_none());
     }
 
     #[test]

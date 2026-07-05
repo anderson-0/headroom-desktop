@@ -23,6 +23,7 @@ const SENTRY_MESSAGE_CHAR_CAP: usize = 400;
 struct FileLogger {
     file: Mutex<Option<File>>,
     path: PathBuf,
+    records_since_rotate_check: std::sync::atomic::AtomicU64,
 }
 
 impl FileLogger {
@@ -121,6 +122,15 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
     {
         return true;
     }
+    // Ad-hoc codesign of venv native extensions is best-effort (EDR nicety):
+    // codesign exits non-zero when a single .so can't be re-signed, but the
+    // rest are signed and the smoke test is the real gate. A per-file failure
+    // isn't actionable, so keep the log line but drop the Sentry event.
+    if target.starts_with("headroom_desktop_lib::tool_manager")
+        && msg.starts_with("ad-hoc codesign exited")
+    {
+        return true;
+    }
     // Uninstall cleanup is best-effort and races a still-exiting backend/proxy
     // that may re-create a file mid-walk ("Directory not empty"). The removal
     // is retried; a residual failure during teardown isn't actionable.
@@ -130,6 +140,22 @@ fn skip_sentry(target: &str, msg: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Replace the user's home directory with `~` wherever it appears.
+pub(crate) fn scrub_home(msg: &str) -> String {
+    match dirs::home_dir() {
+        Some(home) => {
+            let home = home.to_string_lossy();
+            let home = home.trim_end_matches('/');
+            if home.is_empty() {
+                msg.to_string()
+            } else {
+                msg.replace(home, "~")
+            }
+        }
+        None => msg.to_string(),
+    }
 }
 
 impl Log for FileLogger {
@@ -146,7 +172,17 @@ impl Log for FileLogger {
             record.level()
         };
 
-        if display_level <= Level::Warn {
+        // Rotation must not depend on level: an info-heavy session can blow
+        // past MAX_LOG_BYTES without ever logging a warning. Warn+ checks
+        // every record; info/debug check every 64th to keep the stat off the
+        // hot path.
+        if display_level <= Level::Warn
+            || self
+                .records_since_rotate_check
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                % 64
+                == 0
+        {
             self.rotate_if_needed();
         }
         self.write_record(record, display_level);
@@ -159,7 +195,10 @@ impl Log for FileLogger {
                 Level::Error => sentry::Level::Error,
                 _ => sentry::Level::Warning,
             };
-            let truncated: String = msg.chars().take(SENTRY_MESSAGE_CHAR_CAP).collect();
+            // Home paths embed the local username; replace with ~ so it
+            // never leaves the machine.
+            let scrubbed = scrub_home(&msg);
+            let truncated: String = scrubbed.chars().take(SENTRY_MESSAGE_CHAR_CAP).collect();
             sentry::capture_message(&truncated, level);
         }
     }
@@ -188,6 +227,7 @@ pub fn init() -> Result<PathBuf, SetLoggerError> {
     let logger = FileLogger {
         file: Mutex::new(file),
         path: path.clone(),
+        records_since_rotate_check: std::sync::atomic::AtomicU64::new(0),
     };
     log::set_boxed_logger(Box::new(logger))?;
     log::set_max_level(log::LevelFilter::Debug);
@@ -302,6 +342,20 @@ mod tests {
     }
 
     #[test]
+    fn skips_adhoc_codesign_best_effort_warning() {
+        assert!(skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "ad-hoc codesign exited Some(1) for 633 files: /path/_http_writer.so: replacing existing signature"
+        ));
+        // A genuine signing regression surfaces via the smoke-test gate, not
+        // this best-effort line; an unrelated tool_manager warn still reports.
+        assert!(!skip_sentry(
+            "headroom_desktop_lib::tool_manager",
+            "some other tool_manager warning"
+        ));
+    }
+
+    #[test]
     fn keeps_kompress_prefetch_download_error() {
         // The classified-cause variant carries the systemic signal and must
         // reach Sentry.
@@ -317,5 +371,20 @@ mod tests {
             "headroom_desktop_lib::state",
             "some other state warning"
         ));
+    }
+
+    #[test]
+    fn scrub_home_replaces_home_dir_with_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let msg = format!(
+            "cleanup: removing {}/Library/Application Support/x",
+            home.display()
+        );
+        let scrubbed = super::scrub_home(&msg);
+        assert_eq!(
+            scrubbed,
+            "cleanup: removing ~/Library/Application Support/x"
+        );
+        assert_eq!(super::scrub_home("no paths here"), "no paths here");
     }
 }

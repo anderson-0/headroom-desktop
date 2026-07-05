@@ -231,6 +231,11 @@ pub struct ClientSetupResult {
     // this is a soft, expected degradation -- callers use it to avoid alerting.
     #[serde(default)]
     pub shell_profile_unwritable: bool,
+    /// A pre-existing custom base URL (corporate gateway/proxy) that this
+    /// setup replaced. The UI must tell the user their routing changed and
+    /// that the original is restored on disable.
+    #[serde(default)]
+    pub replaced_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -865,6 +870,14 @@ pub struct CodexUsage {
     pub weekly_used_percent: Option<f64>,
     /// Display copy for the codex usage state (active / nudging / near-limit).
     pub gate_message: String,
+    /// The tier-dependent nudge ladder the gate applied (10/15/20 for
+    /// Max-like plans, 25/35/45 for Go/Plus). Drives notification copy so
+    /// titles never hardcode a ladder the gate isn't using.
+    #[serde(default)]
+    pub effective_nudge_thresholds_percent: Vec<f64>,
+    /// The tier-dependent pause threshold the gate applied.
+    #[serde(default)]
+    pub effective_disable_threshold_percent: f64,
 }
 
 /// Raw Codex rate-limit snapshot captured by the intercept proxy from the

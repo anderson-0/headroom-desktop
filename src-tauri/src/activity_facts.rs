@@ -259,14 +259,45 @@ impl ActivityFacts {
             }
         }
 
-        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-        let persisted = serde_json::from_slice::<PersistedActivityFacts>(&bytes)
-            .with_context(|| format!("parsing {}", path.display()))?;
+        // An unreadable file (EACCES/EROFS) must not brick launch any more
+        // than a corrupt one — degrade to a fresh start.
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                log::warn!("activity-facts.json unreadable ({err}); starting fresh");
+                return Ok(Self::empty(path));
+            }
+        };
+        // A corrupt file (e.g. truncated by a crash mid-write) must never
+        // brick launch: an Err here propagates to AppState::new()'s expect()
+        // and panics on every start until the user deletes the file by hand.
+        // Recover the same way as a schema mismatch below.
+        let persisted = match serde_json::from_slice::<PersistedActivityFacts>(&bytes) {
+            Ok(persisted) => persisted,
+            Err(err) => {
+                log::warn!("activity-facts.json is corrupt ({err}); starting fresh");
+                let _ = std::fs::remove_file(&path);
+                return Ok(Self::empty(path));
+            }
+        };
         if persisted.schema_version != SCHEMA_VERSION {
             // Best-effort delete so the next save replaces the stale file
             // outright rather than silently leaving the old payload behind.
             let _ = std::fs::remove_file(&path);
-            return Ok(Self::empty(path));
+            // Salvage the format-agnostic bookkeeping: schema bumps reshape
+            // the *tile slots*, but the record counters, recap dedupe keys,
+            // and fire-once sets are stable scalars — wiping them used to
+            // re-fire the weekly recap and reset all-time records for every
+            // user on every bump (four so far).
+            let mut carried = Self::empty(path);
+            carried.all_time_record_tokens = persisted.all_time_record_tokens;
+            carried.all_time_record_emitted_at = persisted.all_time_record_emitted_at;
+            carried.last_weekly_recap_week_key = persisted.last_weekly_recap_week_key;
+            carried.last_weekly_recap_check_at = persisted.last_weekly_recap_check_at;
+            carried.train_suggestions_fired = persisted.train_suggestions_fired;
+            carried.stale_train_suggestions_fired_at = persisted.stale_train_suggestions_fired_at;
+            carried.dirty = true;
+            return Ok(carried);
         }
 
         Ok(Self {
@@ -385,8 +416,10 @@ impl ActivityFacts {
                 }
             }
 
-            let today = now.format("%Y-%m-%d").to_string();
-            let event_day = observed_at.format("%Y-%m-%d").to_string();
+            // Local calendar days: UTC keys reset the daily record at
+            // mid-afternoon for US users and disagreed with the savings chart.
+            let today = crate::storage::user_day_key(now);
+            let event_day = crate::storage::user_day_key(observed_at);
             let mut emit_tags: Vec<RecordTag> = Vec::new();
             let mut tile_tags: Vec<RecordTag> = Vec::new();
             let mut all_time_previous: Option<u64> = None;
@@ -529,11 +562,11 @@ impl ActivityFacts {
         active_project_path: Option<&str>,
         observed_at: DateTime<Utc>,
     ) -> LearningsMilestoneEvent {
-        let today = observed_at.date_naive();
+        let today = crate::storage::user_day(observed_at);
         let day_changed = self.learnings_snapshot_day != Some(today);
 
         if day_changed {
-            // New UTC day — drop yesterday's snapshots and re-baseline against
+            // New local day — drop yesterday's snapshots and re-baseline against
             // whatever the caller just observed. Today's diffs against this
             // set start at zero.
             self.learnings_snapshots.clear();
@@ -826,8 +859,7 @@ impl ActivityFacts {
             last_train_suggestion: self.last_train_suggestion.clone(),
         };
         let bytes = serde_json::to_vec_pretty(&persisted).context("serializing activity facts")?;
-        std::fs::write(&self.path, bytes)
-            .with_context(|| format!("writing {}", self.path.display()))?;
+        crate::client_adapters::atomic_write(&self.path, &bytes)?;
         self.dirty = false;
         Ok(())
     }
@@ -860,6 +892,46 @@ mod tests {
     use super::*;
     use chrono::{TimeZone, Timelike};
     use tempfile::TempDir;
+
+    #[test]
+    fn load_or_create_survives_unparseable_file() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        let path = base.join("config").join("activity-facts.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{\"schemaVersion\": 3, trunc").unwrap();
+
+        let facts = ActivityFacts::load_or_create(&base).expect("corrupt file must not error");
+        assert_eq!(facts.all_time_record_tokens, 0);
+        assert!(!path.exists(), "corrupt file is removed for a fresh start");
+    }
+
+    #[test]
+    fn schema_mismatch_salvages_records_and_recap_dedupe() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        let path = base.join("config").join("activity-facts.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // An old-schema file: tile slots are stale, but the record counter and
+        // recap dedupe key must survive the bump instead of re-firing
+        // notifications and zeroing all-time records fleet-wide.
+        std::fs::write(
+            &path,
+            br#"{"schemaVersion": 3, "allTimeRecordTokens": 91234, "lastWeeklyRecapWeekKey": "2026-W26"}"#,
+        )
+        .unwrap();
+
+        let facts = ActivityFacts::load_or_create(&base).expect("mismatch must not error");
+        assert_eq!(facts.all_time_record_tokens, 91234);
+        assert_eq!(
+            facts.last_weekly_recap_week_key.as_deref(),
+            Some("2026-W26")
+        );
+        assert!(
+            facts.last_transformation.is_none(),
+            "tile slots from the old schema are dropped"
+        );
+    }
 
     fn mk_transformation(
         model: Option<&str>,

@@ -601,6 +601,14 @@ select {
   color: #8a3d3d;
 }
 
+.install-progress__notice {
+  color: var(--warning);
+  background: var(--warning-tint);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: var(--text-sm);
+}
+
 .intro-shell__art {
   display: grid;
   place-items: center;
@@ -2417,6 +2425,9 @@ select {
 }
 
 .savings-chart__nav-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   border: 1px solid var(--border-default);
   background: rgba(255, 255, 255, 0.78);
   color: #4d453f;

@@ -132,8 +132,12 @@ fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
         "## Token-saving shell commands (Headroom RTK)\n\
          Run shell commands through RTK to get compact, token-optimized output:\n\
          prefix the command with `{bin} ` (for example `{bin} git status`,\n\
-         `{bin} ls -la`, `{bin} cargo build`). RTK passes through anything it\n\
-         does not optimize, so it is safe to use as a prefix for any command."
+         `{bin} ls -la`, `{bin} cargo build`). RTK compacts output, so do NOT\n\
+         use it when you need verbatim text: reading or grepping code you are\n\
+         about to edit or patch (RTK grep strips indentation and truncates long\n\
+         lines), or `git diff --check` (RTK drops its whitespace report). Run\n\
+         those raw. Everything else (status, logs, builds, tests, listings) is\n\
+         safe to prefix."
     )
 }
 
@@ -215,6 +219,7 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
     let mut state = load_setup_state();
     let state_id = normalized_setup_id(client_id).to_string();
     let mut shell_unwritable = false;
+    let mut replaced_base_url = None;
 
     match client_id {
         "claude_code" => {
@@ -222,8 +227,18 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
             // Critical, app-owned writes first: the ~/.claude/settings.json env is
             // what actually routes Claude Code through Headroom. Do it before the
             // shell profile so a locked ~/.zshrc can't block core setup.
-            let mut updates =
+            let (changed, backups, replaced) =
                 configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+            let mut updates = (changed, backups);
+            if let Some(original) = replaced {
+                // A custom gateway/proxy URL was routing Claude before us:
+                // remember it for restore-on-disable and tell the caller so
+                // the UI can inform the user their routing changed.
+                state
+                    .preserved_base_urls
+                    .insert(state_id.clone(), original.clone());
+                replaced_base_url = Some(original);
+            }
             let mut legacy_updates = remove_legacy_vscode_base_url_keys()?;
             updates.0.append(&mut legacy_updates.0);
             updates.1.append(&mut legacy_updates.1);
@@ -263,9 +278,15 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
                 .insert(state_id.clone(), serialize_paths(&shell_targets));
         }
         "vscode" => {
-            let updates = configure_vscode_settings()?;
-            changed_files.extend(updates.0);
-            backup_files.extend(updates.1);
+            let (changed, backups, replaced) = configure_vscode_settings()?;
+            changed_files.extend(changed);
+            backup_files.extend(backups);
+            if let Some(original) = replaced {
+                state
+                    .preserved_base_urls
+                    .insert(state_id.clone(), original.clone());
+                replaced_base_url = Some(original);
+            }
         }
         "codex" | "codex_cli" => {
             let shell_targets = resolve_client_shell_targets(&state, client_id)?;
@@ -351,6 +372,7 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
         },
         verification,
         shell_profile_unwritable: shell_unwritable,
+        replaced_base_url,
     })
 }
 
@@ -463,13 +485,11 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             }
 
             if codex_guard_hook_path().exists() && codex_guard_registered()? {
-                checks.push(
-                    "Found Headroom routing guard registered in ~/.codex/hooks.json.".into(),
-                );
+                checks
+                    .push("Found Headroom routing guard registered in ~/.codex/hooks.json.".into());
             } else {
-                failures.push(
-                    "Headroom routing guard was not found in ~/.codex/hooks.json.".into(),
-                );
+                failures
+                    .push("Headroom routing guard was not found in ~/.codex/hooks.json.".into());
             }
 
             // Independent confirmation from Codex itself, run off-thread: the
@@ -577,7 +597,18 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             // shell profiles after quit — otherwise the user's next shell still
             // has Headroom binaries shadowing whatever's on PATH.
             remove_shell_block(&shell_targets, "managed_rtk")?;
-            remove_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+            // Restore any pre-Headroom gateway/proxy URL instead of deleting
+            // the key — deleting it pointed gateway users at api.anthropic.com
+            // where their credentials may not even work.
+            let preserved = state
+                .preserved_base_urls
+                .get(normalized_setup_id(client_id))
+                .cloned();
+            remove_claude_settings_env(
+                "ANTHROPIC_BASE_URL",
+                HEADROOM_ANTHROPIC_BASE_URL,
+                preserved.as_deref(),
+            )?;
             let _ = remove_legacy_vscode_base_url_keys()?;
             // Strip the PreToolUse hook entry and delete the hook script so CC
             // behaves exactly as it did before Headroom was launched.
@@ -590,7 +621,13 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             }
             let _ = remove_claude_guard_hook();
         }
-        "vscode" => remove_vscode_connector_keys()?,
+        "vscode" => {
+            let preserved = state
+                .preserved_base_urls
+                .get(normalized_setup_id(client_id))
+                .cloned();
+            remove_vscode_connector_keys(preserved.as_deref())?;
+        }
         other => {
             return Err(anyhow!(
                 "Automatic setup disable is not supported yet for {other}.",
@@ -619,6 +656,9 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
             state.remembered_clients.remove(state_id);
             state.managed_shell_files.remove(state_id);
             state.remembered_shell_files.remove(state_id);
+            // Consumed: the URL is back in the user's config now. The next
+            // apply re-captures it if Headroom is re-enabled.
+            state.preserved_base_urls.remove(state_id);
         }
     }
     write_setup_state(&state)?;
@@ -630,8 +670,14 @@ pub fn clear_client_setups() -> Result<()> {
     // disable_client_setup also clears remembered_clients as a side effect,
     // which would otherwise erase the snapshot we need for restore_client_setups.
     let pre = load_setup_state();
-    let snapshot_clients = pre.configured_clients.clone();
-    let snapshot_shell_files = pre.managed_shell_files.clone();
+    // Merge with any prior snapshot so a second clear is idempotent: after a
+    // pause, configured_clients is already empty and only remembered_clients
+    // holds the restore set — a quit-time clear must not wipe it (pause then
+    // Cmd-Q used to permanently lose all connectors).
+    let mut snapshot_clients = pre.remembered_clients.clone();
+    snapshot_clients.extend(pre.configured_clients.clone());
+    let mut snapshot_shell_files = pre.remembered_shell_files.clone();
+    snapshot_shell_files.extend(pre.managed_shell_files.clone());
 
     for spec in MANAGED_CLIENT_SPECS {
         let _ = disable_client_setup(spec.id);
@@ -856,8 +902,11 @@ fn remove_pre_tool_use_markers(settings_path: &Path, markers: &[&str]) -> Result
         .and_then(|value| value.as_array_mut())
     {
         let before = pre_tool_use.len();
-        pre_tool_use
-            .retain(|entry| !markers.iter().any(|marker| entry_contains_hook(entry, marker)));
+        pre_tool_use.retain(|entry| {
+            !markers
+                .iter()
+                .any(|marker| entry_contains_hook(entry, marker))
+        });
         if pre_tool_use.len() != before {
             changed = true;
         }
@@ -875,12 +924,11 @@ fn remove_pre_tool_use_markers(settings_path: &Path, markers: &[&str]) -> Result
     }
 
     let _ = backup_if_exists(settings_path)?;
-    std::fs::write(
+    atomic_write(
         settings_path,
-        serde_json::to_vec_pretty(&Value::Object(root))
+        &serde_json::to_vec_pretty(&Value::Object(root))
             .context("serializing Claude settings for hook cleanup")?,
-    )
-    .with_context(|| format!("writing {}", settings_path.display()))?;
+    )?;
 
     Ok(true)
 }
@@ -1039,6 +1087,13 @@ struct ClientSetupState {
     managed_shell_files: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     remembered_shell_files: BTreeMap<String, Vec<String>>,
+    /// Pre-existing custom base URLs (corporate gateway, LiteLLM, Bedrock
+    /// proxy) that setup replaced with Headroom's, keyed by client state id.
+    /// Restored verbatim on disable/uninstall — setup used to clobber these
+    /// and never put them back, silently unrouting enterprise users from
+    /// their gateway.
+    #[serde(default)]
+    preserved_base_urls: BTreeMap<String, String>,
     /// User opted RTK out via the tool status toggle. When true, bootstrap and
     /// client setup skip re-adding the RTK PATH export and Claude Code hook.
     #[serde(default)]
@@ -1122,22 +1177,34 @@ fn write_setup_state(state: &ClientSetupState) -> Result<()> {
     let path = setup_state_path();
     let payload = serde_json::to_vec_pretty(state).context("serializing client setup state")?;
 
-    // Publish atomically: write to a sibling tmp file then rename. POSIX
-    // rename is atomic, so concurrent readers (e.g. the tray-icon thread
-    // calling `is_claude_code_enabled` every 2s) see either the old file or
-    // the new one — never a half-written truncate. The previous direct
-    // `fs::write` opened a microsecond window where readers parsed an empty
-    // file, concluded no clients were configured, and flipped the tray to
-    // "Disconnected" with a spurious notification.
+    atomic_write(&path, &payload)
+}
+
+/// Write via a sibling tmp file then rename. POSIX rename is atomic, so
+/// concurrent readers (other apps parsing their own config, the tray-icon
+/// thread calling `is_claude_code_enabled` every 2s) see either the old file
+/// or the new one — never a half-written truncate. A plain `fs::write` also
+/// leaves a truncated file behind on crash/power loss mid-write, which for
+/// user-owned configs (settings.json, config.toml, shell rc files) breaks the
+/// user's shell or client startup.
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> Result<()> {
+    // Per-writer unique tmp name. A fixed `<path>.tmp` is shared by concurrent
+    // writers to the same file: A renames tmp->path, then B's rename finds its
+    // tmp already consumed and fails ENOENT (Sentry RUST-3W / RUST-4W). pid +
+    // a process-local counter makes each write's tmp its own.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp_path = {
-        let mut s = path.clone().into_os_string();
-        s.push(".tmp");
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut s = path.as_os_str().to_os_string();
+        s.push(format!(".tmp.{}.{}", std::process::id(), n));
         PathBuf::from(s)
     };
-    std::fs::write(&tmp_path, &payload)
+    std::fs::write(&tmp_path, contents)
         .with_context(|| format!("writing {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
-        .with_context(|| format!("renaming {} -> {}", tmp_path.display(), path.display()))
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp_path); // don't leak the tmp on failure
+        format!("renaming {} -> {}", tmp_path.display(), path.display())
+    })
 }
 
 fn setup_state_path() -> PathBuf {
@@ -1421,9 +1488,9 @@ fn set_markitdown_bash_permission(shim_path: &Path, present: bool) -> Result<boo
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let _ = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&content).context("serializing Claude permissions settings")?,
+        &serde_json::to_vec_pretty(&content).context("serializing Claude permissions settings")?,
     )
     .with_context(|| format!("writing {}", settings_path.display()))?;
     Ok(true)
@@ -1449,17 +1516,21 @@ fn clear_legacy_codex_gui_launch_env() -> Result<()> {
     Ok(())
 }
 
-fn configure_vscode_settings() -> Result<(Vec<String>, Vec<String>)> {
-    let (mut changed_files, mut backup_files) =
+fn configure_vscode_settings() -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+    let (mut changed_files, mut backup_files, replaced) =
         configure_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
     let (legacy_changed, legacy_backups) = remove_legacy_vscode_base_url_keys()?;
     changed_files.extend(legacy_changed);
     backup_files.extend(legacy_backups);
-    Ok((changed_files, backup_files))
+    Ok((changed_files, backup_files, replaced))
 }
 
-fn remove_vscode_connector_keys() -> Result<()> {
-    remove_claude_settings_env("ANTHROPIC_BASE_URL", HEADROOM_ANTHROPIC_BASE_URL)?;
+fn remove_vscode_connector_keys(restore_value: Option<&str>) -> Result<()> {
+    remove_claude_settings_env(
+        "ANTHROPIC_BASE_URL",
+        HEADROOM_ANTHROPIC_BASE_URL,
+        restore_value,
+    )?;
     let _ = remove_legacy_vscode_base_url_keys()?;
     Ok(())
 }
@@ -1490,10 +1561,14 @@ fn remove_json_key_if_matches(
     }
 }
 
+/// Point `env.<env_key>` at Headroom. The third return element is a
+/// pre-existing *foreign* value this write replaced (a corporate gateway,
+/// LiteLLM, or Bedrock-proxy URL) — callers must preserve it and restore it
+/// on disable instead of just deleting the key.
 fn configure_claude_settings_env(
     env_key: &str,
     env_value: &str,
-) -> Result<(Vec<String>, Vec<String>)> {
+) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
     let settings_path = claude_settings_path();
     let mut content = if settings_path.exists() {
         let raw = std::fs::read_to_string(&settings_path)
@@ -1523,9 +1598,15 @@ fn configure_claude_settings_env(
         return Err(anyhow!("unable to write Claude env settings"));
     };
 
+    let replaced_foreign_value = env_obj
+        .get(env_key)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty() && *value != env_value)
+        .map(str::to_string);
+
     let changed = set_json_string(env_obj, env_key, env_value);
     if !changed {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), None));
     }
 
     if let Some(parent) = settings_path.parent() {
@@ -1534,9 +1615,9 @@ fn configure_claude_settings_env(
     }
 
     let backup = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&content).context("serializing Claude settings")?,
+        &serde_json::to_vec_pretty(&content).context("serializing Claude settings")?,
     )
     .with_context(|| format!("writing {}", settings_path.display()))?;
 
@@ -1546,6 +1627,7 @@ fn configure_claude_settings_env(
             .into_iter()
             .map(|path| path.display().to_string())
             .collect(),
+        replaced_foreign_value,
     ))
 }
 
@@ -1623,9 +1705,9 @@ fn ensure_claude_settings_hook(
     }
 
     let backup = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&content).context("serializing Claude hook settings")?,
+        &serde_json::to_vec_pretty(&content).context("serializing Claude hook settings")?,
     )
     .with_context(|| format!("writing {}", settings_path.display()))?;
 
@@ -1638,7 +1720,16 @@ fn ensure_claude_settings_hook(
     ))
 }
 
-fn remove_claude_settings_env(env_key: &str, expected_value: &str) -> Result<()> {
+/// Undo `configure_claude_settings_env`: if `env.<env_key>` still equals
+/// Headroom's value, put back `restore_value` (the user's pre-Headroom
+/// gateway URL) when one was preserved, otherwise delete the key. A key that
+/// no longer matches Headroom's value was changed by the user and is left
+/// alone.
+fn remove_claude_settings_env(
+    env_key: &str,
+    expected_value: &str,
+    restore_value: Option<&str>,
+) -> Result<()> {
     let settings_path = claude_settings_path();
     if !settings_path.exists() {
         return Ok(());
@@ -1650,7 +1741,17 @@ fn remove_claude_settings_env(env_key: &str, expected_value: &str) -> Result<()>
     let mut changed = false;
 
     if let Some(Value::Object(env_obj)) = root.get_mut("env") {
-        changed |= remove_json_key_if_matches(env_obj, env_key, expected_value);
+        match restore_value {
+            Some(original)
+                if env_obj.get(env_key).and_then(|v| v.as_str()) == Some(expected_value) =>
+            {
+                env_obj.insert(env_key.into(), Value::String(original.to_string()));
+                changed = true;
+            }
+            _ => {
+                changed |= remove_json_key_if_matches(env_obj, env_key, expected_value);
+            }
+        }
         if env_obj.is_empty() {
             root.remove("env");
             changed = true;
@@ -1662,12 +1763,11 @@ fn remove_claude_settings_env(env_key: &str, expected_value: &str) -> Result<()>
     }
 
     let _ = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&Value::Object(root))
+        &serde_json::to_vec_pretty(&Value::Object(root))
             .context("serializing Claude settings for connector removal")?,
-    )
-    .with_context(|| format!("writing {}", settings_path.display()))?;
+    )?;
 
     Ok(())
 }
@@ -1703,12 +1803,26 @@ fn entry_contains_hook(entry: &Value, hook_fragment: &str) -> bool {
         .map(|hooks| {
             hooks.iter().any(|hook| {
                 hook.get("command")
-                    .and_then(|command| command.as_str())
-                    .map(|command| command.contains(hook_fragment))
-                    .unwrap_or(false)
+                    .is_some_and(|c| command_contains(c, hook_fragment))
             })
         })
         .unwrap_or(false)
+}
+
+/// Match a hook `command` against a fragment, tolerating both the Claude string
+/// form (`"/usr/bin/python3 /path/guard.py"`) and the argv-array form Codex
+/// normalizes to (`["python3", "/path/guard.py"]`). Callers pass the guard
+/// *script path* as the fragment so a differing interpreter (system vs Homebrew
+/// python3) can't leave the entry behind when the script is deleted.
+fn command_contains(command: &Value, fragment: &str) -> bool {
+    match command {
+        Value::String(s) => s.contains(fragment),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|p| p.contains(fragment)),
+        _ => false,
+    }
 }
 
 fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
@@ -1734,12 +1848,11 @@ fn remove_legacy_vscode_base_url_keys() -> Result<(Vec<String>, Vec<String>)> {
     }
 
     let backup = backup_if_exists(&settings_path)?;
-    std::fs::write(
+    atomic_write(
         &settings_path,
-        serde_json::to_vec_pretty(&Value::Object(obj))
+        &serde_json::to_vec_pretty(&Value::Object(obj))
             .context("serializing VS Code settings for legacy key cleanup")?,
-    )
-    .with_context(|| format!("writing {}", settings_path.display()))?;
+    )?;
 
     Ok((
         vec![settings_path.display().to_string()],
@@ -1780,12 +1893,6 @@ const CODEX_TABLE_BLOCK_ID: &str = "codex_cli_provider";
 const CODEX_HEADROOM_PROVIDER: &str = "headroom";
 const CODEX_NATIVE_PROVIDER: &str = "openai";
 
-/// Codex store-schema versions this build has been verified against. Discovered
-/// stores with a version outside this set are still retagged (best-effort) but
-/// logged, so a Codex store bump is visible before it can silently split the
-/// history menu for everyone.
-const KNOWN_CODEX_STORE_VERSIONS: &[u32] = &[5];
-
 /// Directories Codex is known to keep its state store in: the v148 GUI uses
 /// `<codex_home>/sqlite/`, the CLI/TUI uses `<codex_home>/`.
 fn codex_state_dirs() -> Vec<PathBuf> {
@@ -1816,20 +1923,15 @@ fn codex_sqlite_store_expected() -> bool {
     })
 }
 
-/// Parse `N` from a `state_<N>.sqlite` filename (`state_5.sqlite` -> `Some(5)`).
-/// Anything else -> `None`.
-fn codex_store_version(path: &Path) -> Option<u32> {
-    let name = path.file_name()?.to_str()?;
-    name.strip_prefix("state_")?.strip_suffix(".sqlite")?.parse().ok()
-}
-
-/// Discover every `state_<N>.sqlite` store under the known Codex dirs, with the
-/// version parsed from its name. Scanning the directories (rather than probing a
-/// hardcoded `state_5.sqlite`) means a future Codex store-version bump keeps
-/// working without a release instead of silently no-opping for every user at
-/// once. A missing dir (`read_dir` error) is skipped. Paths are deduped in case
-/// the two dirs ever resolve to the same place.
-fn discover_codex_state_dbs() -> Vec<(PathBuf, u32)> {
+/// Discover every `*.sqlite` file under the known Codex dirs. The thread store's
+/// *filename* has changed across Codex versions (`state_5.sqlite`, and whatever
+/// comes next), so we no longer couple discovery to a name scheme: every sqlite
+/// candidate is handed to `retag_one_codex_db`, which identifies the real store
+/// by its `threads` table and no-ops on anything else (logs/goals/memories). A
+/// rename can no longer silently split the history menu. A missing dir
+/// (`read_dir` error) is skipped. Paths are deduped in case the two dirs ever
+/// resolve to the same place.
+fn discover_codex_state_dbs() -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
     for dir in codex_state_dirs() {
@@ -1838,11 +1940,10 @@ fn discover_codex_state_dbs() -> Vec<(PathBuf, u32)> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(version) = codex_store_version(&path) else {
-                continue;
-            };
-            if seen.insert(path.clone()) {
-                out.push((path, version));
+            if path.extension().and_then(|e| e.to_str()) == Some("sqlite")
+                && seen.insert(path.clone())
+            {
+                out.push(path);
             }
         }
     }
@@ -1855,60 +1956,43 @@ fn discover_codex_state_dbs() -> Vec<(PathBuf, u32)> {
 /// and skipped. Only rows whose `model_provider` equals `from` are touched, so
 /// third-party providers are left alone.
 fn retag_codex_thread_providers(from: &str, to: &str) {
-    let stores = discover_codex_state_dbs();
-    if stores.is_empty() {
-        // Only a signal when a sqlite thread store is actually expected: the
-        // launch/quit lifecycle hooks call this for every user, so a clean
-        // machine -- or a CLI-only / pre-sqlite Codex with config but no
-        // state_<N>.sqlite -- must stay silent. A present sqlite/ dir with no
-        // recognized store is the genuine moved/renamed case worth flagging.
-        if codex_sqlite_store_expected() {
-            // We only reach here when no state_<integer>.sqlite parsed, so any
-            // state_*.sqlite still present is the unrecognized scheme. Log the
-            // actual names: a future occurrence reveals what Codex renamed the
-            // store to so codex_store_version can be extended instead of guessed
-            // at (Sentry RUST-43).
-            let unrecognized: Vec<String> = codex_state_dirs()
-                .iter()
-                .filter_map(|dir| std::fs::read_dir(dir).ok())
-                .flat_map(|entries| entries.flatten())
-                .filter_map(|e| e.file_name().to_str().map(str::to_owned))
-                .filter(|n| n.starts_with("state_") && n.ends_with(".sqlite"))
-                .collect();
-            log::warn!(
-                "codex retag {from}->{to}: Codex store present but unrecognized naming \
-                 {unrecognized:?} under {dirs:?}; the history menu may split. Extend \
-                 codex_store_version to parse it.",
-                dirs = codex_state_dirs(),
-            );
-        }
-        return;
-    }
-    for (path, version) in stores {
-        if !KNOWN_CODEX_STORE_VERSIONS.contains(&version) {
-            log::warn!(
-                "codex retag: store version {version} at {} is outside the known \
-                 set {KNOWN_CODEX_STORE_VERSIONS:?}; retagging anyway. Verify the \
-                 history menu still works and add {version} to \
-                 KNOWN_CODEX_STORE_VERSIONS.",
-                path.display(),
-            );
-        }
+    let mut found_thread_store = false;
+    for path in discover_codex_state_dbs() {
         match retag_one_codex_db(&path, from, to) {
-            Ok(0) => {}
-            Ok(n) => log::info!(
-                "codex retag {from}->{to}: {n} thread(s) in {}",
-                path.display()
-            ),
+            // No `threads` table: unrelated sqlite store (logs/goals/memories).
+            Ok(None) => {}
+            Ok(Some(n)) => {
+                found_thread_store = true;
+                if n > 0 {
+                    log::info!(
+                        "codex retag {from}->{to}: {n} thread(s) in {}",
+                        path.display()
+                    );
+                }
+            }
             Err(e) => log::warn!(
                 "codex retag {from}->{to} skipped for {}: {e}",
                 path.display()
             ),
         }
     }
+    // A `state_*.sqlite`-shaped file with no `threads` table means Codex renamed
+    // the table itself (discovery already survives a file rename). Only flag when
+    // the store-shaped name is present, so a clean or CLI-only / pre-sqlite
+    // machine -- or one with just logs/goals/memories DBs -- stays silent
+    // (Sentry RUST-3R). This is the last remaining schema-drift signal worth a
+    // release (Sentry RUST-43).
+    if !found_thread_store && codex_sqlite_store_expected() {
+        log::warn!(
+            "codex retag {from}->{to}: a state_*.sqlite is present but has no \
+             `threads` table under {dirs:?}; the history menu may split. Codex \
+             likely renamed the table.",
+            dirs = codex_state_dirs(),
+        );
+    }
 }
 
-fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<usize> {
+fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<Option<usize>> {
     use rusqlite::OptionalExtension;
 
     let conn = rusqlite::Connection::open(path)?;
@@ -1923,12 +2007,13 @@ fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<usi
         .optional()?
         .is_some();
     if !has_table {
-        return Ok(0);
+        return Ok(None);
     }
     conn.execute(
         "UPDATE threads SET model_provider = ?2 WHERE model_provider = ?1",
         rusqlite::params![from, to],
     )
+    .map(Some)
 }
 
 /// Retag Codex threads back to the native provider. Exposed for the app-quit
@@ -2033,7 +2118,9 @@ fn strip_marker_block(content: &str, block_id: &str) -> String {
         if end_idx < start_idx {
             break; // malformed (stray end before start) — leave it alone
         }
-        let tail = out[end_idx + end.len()..].trim_start_matches('\n').to_string();
+        let tail = out[end_idx + end.len()..]
+            .trim_start_matches('\n')
+            .to_string();
         let head = out[..start_idx].trim_end().to_string();
         let mut rebuilt = String::with_capacity(out.len());
         rebuilt.push_str(&head);
@@ -2084,7 +2171,7 @@ fn configure_codex_provider_block() -> Result<(Vec<String>, Vec<String>)> {
     }
 
     let backup = backup_if_exists(&path)?;
-    std::fs::write(&path, &updated).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, updated.as_bytes())?;
 
     let mut backup_files = Vec::new();
     if let Some(backup_path) = backup {
@@ -2110,27 +2197,51 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
 
-    let target_line = format!("command = {}", toml_basic_string(&entrypoint.to_string_lossy()));
+    let target_line = format!(
+        "command = {}",
+        toml_basic_string(&entrypoint.to_string_lossy())
+    );
+    // The upstream registrar may resolve the server as `<python> -m headroom.cli
+    // mcp serve`. Pinning only `command` to the console script would leave
+    // `args = ["-m", "headroom.cli", ...]` behind, and `headroom -m ...` fails
+    // with "No such option '-m'" — so the args must be pinned together.
+    let target_args_line = r#"args = ["mcp", "serve"]"#;
 
     let mut in_headroom_table = false;
     let mut replaced = false;
+    // When the replaced `args` value is a multi-line array, the continuation
+    // lines ("-m", / "headroom.cli", / ]) must be dropped too, or the rebuilt
+    // file is invalid TOML and Codex fails to load its config entirely.
+    let mut skip_array_depth: i32 = 0;
     let mut out: Vec<String> = Vec::with_capacity(content.lines().count());
     for line in content.lines() {
+        if skip_array_depth > 0 {
+            skip_array_depth += bracket_delta(line);
+            continue;
+        }
         let trimmed = line.trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             in_headroom_table = trimmed == "[mcp_servers.headroom]";
             out.push(line.to_string());
             continue;
         }
-        if in_headroom_table
-            && !replaced
-            && trimmed
+        if in_headroom_table {
+            match trimmed
                 .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "command")
-        {
-            out.push(target_line.clone());
-            replaced = true;
-            continue;
+                .map(|(key, value)| (key.trim(), value))
+            {
+                Some(("command", _)) => {
+                    out.push(target_line.clone());
+                    replaced = true;
+                    continue;
+                }
+                Some(("args", value)) => {
+                    out.push(target_args_line.to_string());
+                    skip_array_depth = bracket_delta(value).max(0);
+                    continue;
+                }
+                _ => {}
+            }
         }
         out.push(line.to_string());
     }
@@ -2145,9 +2256,40 @@ pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
     if rebuilt == content {
         return Ok(None);
     }
+    // Never publish a config Codex can't parse — bail and leave the user's
+    // file untouched instead.
+    toml::from_str::<toml::Value>(&rebuilt).with_context(|| {
+        format!(
+            "rebuilt {} is not valid TOML; refusing to overwrite",
+            path.display()
+        )
+    })?;
     let _ = backup_if_exists(&path)?;
-    std::fs::write(&path, rebuilt).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, rebuilt.as_bytes())?;
     Ok(Some(path.display().to_string()))
+}
+
+/// Net `[` minus `]` on a line, ignoring brackets inside basic strings.
+/// Good enough for tracking whether a TOML array value has closed.
+fn bracket_delta(line: &str) -> i32 {
+    let mut delta = 0;
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '#' if !in_string => break,
+            '[' if !in_string => delta += 1,
+            ']' if !in_string => delta -= 1,
+            _ => {}
+        }
+    }
+    delta
 }
 
 fn toml_basic_string(value: &str) -> String {
@@ -2203,7 +2345,7 @@ fn remove_codex_provider_block() -> Result<()> {
         return Ok(());
     }
     let _ = backup_if_exists(&path)?;
-    std::fs::write(&path, &normalized).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, normalized.as_bytes())?;
     Ok(())
 }
 
@@ -2215,9 +2357,19 @@ fn remove_codex_toml_key(key: &str, expected_value: &str) -> Result<()> {
     let content =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
     let target_line = format!("{key} = \"{expected_value}\"");
+    // Only remove the key from the root table: an identical `key = value`
+    // line inside some other table ([profiles.x], a user's own server entry)
+    // belongs to that table, not to the block we installed.
+    let mut in_root_table = true;
     let filtered: Vec<&str> = content
         .lines()
-        .filter(|l| l.trim() != target_line)
+        .filter(|l| {
+            let trimmed = l.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_root_table = false;
+            }
+            !(in_root_table && trimmed == target_line)
+        })
         .collect();
     if filtered.len() == content.lines().count() {
         return Ok(());
@@ -2227,7 +2379,7 @@ fn remove_codex_toml_key(key: &str, expected_value: &str) -> Result<()> {
     if !result.ends_with('\n') && !result.is_empty() {
         result.push('\n');
     }
-    std::fs::write(&path, result).with_context(|| format!("writing {}", path.display()))?;
+    atomic_write(&path, result.as_bytes())?;
     Ok(())
 }
 
@@ -2263,6 +2415,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -2275,10 +2428,20 @@ CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or (pathlib.Path.home() /
 CONFIG = CODEX_HOME / "config.toml"
 BASE_URL = "{base}"
 READYZ = "{readyz}"
+# stderr fires every invocation; the macOS notification is rate-limited so an
+# app restart doesn't produce a storm of alerts.
+DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
+DEBOUNCE_SECONDS = 600
 
 
 def notify(message):
     try:
+        if time.time() - DEBOUNCE_PATH.stat().st_mtime < DEBOUNCE_SECONDS:
+            return
+    except OSError:
+        pass
+    try:
+        DEBOUNCE_PATH.touch()
         subprocess.run(
             [
                 "/usr/bin/osascript",
@@ -2328,14 +2491,24 @@ def load_config():
     return toml_fallback(text)
 
 
-def reachable():
+def probe():
+    # Any HTTP response means our server answered -- the app is up. A 503 during
+    # bypass mode is still "up", so only connection errors / timeouts count as down.
     try:
-        with urllib.request.urlopen(READYZ, timeout=2) as response:
-            return response.status < 500
-    except urllib.error.HTTPError as exc:
-        return exc.code == 404
+        urllib.request.urlopen(READYZ, timeout=2)
+        return True
+    except urllib.error.HTTPError:
+        return True
     except Exception:
         return False
+
+
+def reachable():
+    # One retry after a short pause so an app-relaunch blip doesn't read as "down".
+    if probe():
+        return True
+    time.sleep(2)
+    return probe()
 
 
 def main():
@@ -2344,13 +2517,15 @@ def main():
     if config is None:
         issues.append("~/.codex/config.toml is missing or unreadable")
     else:
-        if config.get("model_provider") != "headroom":
-            issues.append('Codex model_provider is not "headroom"; it is not routing through Headroom')
+        provider_name = config.get("model_provider")
+        if provider_name != "headroom":
+            issues.append('Codex model_provider is "' + str(provider_name) + '" (expected "headroom"); not routing through Headroom')
         provider = (config.get("model_providers") or {{}}).get("headroom") or {{}}
-        if provider.get("base_url") != BASE_URL:
-            issues.append("Headroom provider base_url is not " + BASE_URL)
+        base = provider.get("base_url")
+        if base != BASE_URL:
+            issues.append("Headroom provider base_url is " + str(base) + " (expected " + BASE_URL + ")")
     if not reachable():
-        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- open the app")
+        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- it may be restarting; open the app if it isn't")
 
     if issues:
         notify("; ".join(issues))
@@ -2411,7 +2586,10 @@ fn register_guard_hook_entries(
             .get_mut(event)
             .and_then(Value::as_array_mut)
             .ok_or_else(|| anyhow!("unable to write hooks settings"))?;
-        if entries.iter().any(|entry| entry_contains_hook(entry, command)) {
+        if entries
+            .iter()
+            .any(|entry| entry_contains_hook(entry, command))
+        {
             continue;
         }
         let handler = serde_json::json!({
@@ -2438,11 +2616,10 @@ fn register_guard_hook_entries(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
-    std::fs::write(
+    atomic_write(
         hooks_path,
-        serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
-    )
-    .with_context(|| format!("writing {}", hooks_path.display()))?;
+        &serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
+    )?;
 
     let mut backups = Vec::new();
     if let Some(backup) = backup {
@@ -2477,7 +2654,11 @@ fn guard_registered_in_hooks(hooks_path: &Path, command: &str) -> Result<bool> {
 /// user-authored hooks intact and drops now-empty event arrays. `delete_if_empty`
 /// removes the whole file when nothing remains -- correct for Codex's standalone
 /// `hooks.json`, but never for Claude's shared `settings.json`.
-fn remove_guard_hook_entries(hooks_path: &Path, command: &str, delete_if_empty: bool) -> Result<()> {
+fn remove_guard_hook_entries(
+    hooks_path: &Path,
+    command: &str,
+    delete_if_empty: bool,
+) -> Result<()> {
     if !hooks_path.exists() {
         return Ok(());
     }
@@ -2487,8 +2668,11 @@ fn remove_guard_hook_entries(hooks_path: &Path, command: &str, delete_if_empty: 
     let mut changed = false;
     let mut hooks_empty = false;
     if let Some(hooks_obj) = content.get_mut("hooks").and_then(Value::as_object_mut) {
-        for event in ["SessionStart", "UserPromptSubmit"] {
-            if let Some(entries) = hooks_obj.get_mut(event).and_then(Value::as_array_mut) {
+        // Sweep every event, not just the two we register, so a guard that Codex
+        // (or an older build) moved to another event is still stripped.
+        let events: Vec<String> = hooks_obj.keys().cloned().collect();
+        for event in events {
+            if let Some(entries) = hooks_obj.get_mut(&event).and_then(Value::as_array_mut) {
                 let before = entries.len();
                 entries.retain(|entry| !entry_contains_hook(entry, command));
                 if entries.len() != before {
@@ -2512,11 +2696,10 @@ fn remove_guard_hook_entries(hooks_path: &Path, command: &str, delete_if_empty: 
     if delete_if_empty && root_empty {
         let _ = std::fs::remove_file(hooks_path);
     } else {
-        std::fs::write(
+        atomic_write(
             hooks_path,
-            serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
-        )
-        .with_context(|| format!("writing {}", hooks_path.display()))?;
+            &serde_json::to_vec_pretty(&content).context("serializing hooks file")?,
+        )?;
     }
     Ok(())
 }
@@ -2548,8 +2731,15 @@ fn codex_guard_registered() -> Result<bool> {
 }
 
 fn remove_codex_guard_hook() -> Result<()> {
-    remove_guard_hook_entries(&codex_hooks_json_path(), &codex_guard_command(), true)?;
     let script_path = codex_guard_hook_path();
+    // Match on the script path, not the full `/usr/bin/python3 <path>` command,
+    // so the registration is stripped even if the interpreter differs -- otherwise
+    // deleting the script below leaves a dangling hook that fails with ENOENT.
+    remove_guard_hook_entries(
+        &codex_hooks_json_path(),
+        &script_path.display().to_string(),
+        true,
+    )?;
     if script_path.exists() {
         let _ = std::fs::remove_file(&script_path);
     }
@@ -2581,17 +2771,29 @@ fn build_claude_guard_script() -> String {
 """Headroom Claude routing guard (managed by Headroom Desktop -- do not edit)."""
 import json
 import os
+import pathlib
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
 BASE_URL = "{base}"
 READYZ = "{readyz}"
+# stderr fires every invocation; the macOS notification is rate-limited so an
+# app restart doesn't produce a storm of alerts.
+DEBOUNCE_PATH = pathlib.Path(__file__).with_name(".headroom-guard-notified")
+DEBOUNCE_SECONDS = 600
 
 
 def notify(message):
     try:
+        if time.time() - DEBOUNCE_PATH.stat().st_mtime < DEBOUNCE_SECONDS:
+            return
+    except OSError:
+        pass
+    try:
+        DEBOUNCE_PATH.touch()
         subprocess.run(
             [
                 "/usr/bin/osascript",
@@ -2607,22 +2809,66 @@ def notify(message):
         pass
 
 
-def reachable():
+def probe():
+    # Any HTTP response means our server answered -- the app is up. A 503 during
+    # bypass mode is still "up", so only connection errors / timeouts count as down.
     try:
-        with urllib.request.urlopen(READYZ, timeout=2) as response:
-            return response.status < 500
-    except urllib.error.HTTPError as exc:
-        return exc.code == 404
+        urllib.request.urlopen(READYZ, timeout=2)
+        return True
+    except urllib.error.HTTPError:
+        return True
     except Exception:
         return False
 
 
+def reachable():
+    # One retry after a short pause so an app-relaunch blip doesn't read as "down".
+    if probe():
+        return True
+    time.sleep(2)
+    return probe()
+
+
+def settings_base(path):
+    # env.ANTHROPIC_BASE_URL from a Claude settings file, or None if absent/unreadable.
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except Exception:
+        return None
+    env = data.get("env") if isinstance(data, dict) else None
+    if isinstance(env, dict):
+        value = env.get("ANTHROPIC_BASE_URL")
+        return str(value) if value is not None else None
+    return None
+
+
+def diagnose_route(effective):
+    # Explain WHY the effective route is not Headroom: a higher-precedence settings
+    # scope, an unapplied env (GUI/IDE launch or needs restart), or missing config.
+    shown = effective if effective else "unset"
+    home = os.path.expanduser("~")
+    user_val = settings_base(os.path.join(home, ".claude", "settings.json"))
+    cwd = os.getcwd()
+    for path in (
+        os.path.join(cwd, ".claude", "settings.local.json"),
+        os.path.join(cwd, ".claude", "settings.json"),
+    ):
+        val = settings_base(path)
+        if val is not None and val != BASE_URL:
+            return "ANTHROPIC_BASE_URL=" + shown + " -- " + path + " sets it to " + val + ", which overrides Headroom's route (" + BASE_URL + "). Remove or fix that entry."
+    if user_val == BASE_URL:
+        return "Headroom is configured (user settings = " + BASE_URL + ") but this session started with ANTHROPIC_BASE_URL=" + shown + ". If you launched Claude from an app/IDE it did not inherit the Headroom shell env -- restart Claude Code from a terminal, or reopen the Headroom app."
+    return "ANTHROPIC_BASE_URL is not routed to Headroom in ~/.claude/settings.json (session has " + shown + "). Reopen the Headroom app or re-run client setup."
+
+
 def main():
     issues = []
-    if os.environ.get("ANTHROPIC_BASE_URL") != BASE_URL:
-        issues.append("ANTHROPIC_BASE_URL is not " + BASE_URL + "; Claude is not routing through Headroom")
+    effective = os.environ.get("ANTHROPIC_BASE_URL")
+    if effective != BASE_URL:
+        issues.append(diagnose_route(effective))
     if not reachable():
-        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- open the app")
+        issues.append("Headroom Desktop is not reachable on 127.0.0.1:6767 -- it may be restarting; open the app if it isn't")
 
     if issues:
         notify("; ".join(issues))
@@ -2669,11 +2915,12 @@ fn claude_guard_registered() -> Result<bool> {
 /// Never deletes settings.json (it carries other keys), so `delete_if_empty` is
 /// false.
 fn remove_claude_guard_hook() -> Result<()> {
-    let command = claude_guard_command();
-    for settings_path in claude_settings_candidates() {
-        let _ = remove_guard_hook_entries(&settings_path, &command, false);
-    }
     let script_path = claude_guard_hook_path();
+    // Match on the script path, not the full interpreter command (see codex counterpart).
+    let fragment = script_path.display().to_string();
+    for settings_path in claude_settings_candidates() {
+        let _ = remove_guard_hook_entries(&settings_path, &fragment, false);
+    }
     if script_path.exists() {
         let _ = std::fs::remove_file(&script_path);
     }
@@ -2776,8 +3023,7 @@ fn upsert_managed_block(
     }
 
     let backup = backup_if_exists(file_path)?;
-    std::fs::write(file_path, updated)
-        .with_context(|| format!("writing {}", file_path.display()))?;
+    atomic_write(file_path, updated.as_bytes())?;
     Ok((true, backup))
 }
 
@@ -2816,8 +3062,7 @@ fn write_file_if_changed(
     }
 
     let backup = backup_if_exists(file_path)?;
-    std::fs::write(file_path, content)
-        .with_context(|| format!("writing {}", file_path.display()))?;
+    atomic_write(file_path, content.as_bytes())?;
 
     #[cfg(unix)]
     if executable {
@@ -2868,12 +3113,11 @@ fn remove_managed_block(file_path: &Path, block_id: &str) -> Result<bool> {
     }
 
     let _ = backup_if_exists(file_path)?;
-    std::fs::write(file_path, rebuilt)
-        .with_context(|| format!("writing {}", file_path.display()))?;
+    atomic_write(file_path, rebuilt.as_bytes())?;
     Ok(true)
 }
 
-fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
+pub(crate) fn backup_if_exists(path: &Path) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -3361,6 +3605,12 @@ if [ -z "$CMD" ]; then
   exit 0
 fi
 
+# `rtk git diff --check` swallows the whitespace-error report the flag exists to
+# produce (only the exit code survives), so any --check command must stay raw.
+case " $CMD " in
+  *" --check "*) exit 0 ;;
+esac
+
 REWRITTEN="$("$HEADROOM_RTK" rewrite "$CMD" 2>/dev/null || true)"
 if [ -z "$REWRITTEN" ] || [ "$CMD" = "$REWRITTEN" ]; then
   exit 0
@@ -3657,12 +3907,25 @@ pub(crate) fn codex_logged_in() -> bool {
 fn parse_json_object(raw: &str, path: &Path) -> Result<serde_json::Map<String, Value>> {
     let value: Value = match serde_json::from_str(raw) {
         Ok(value) => value,
-        Err(_) => json5::from_str(raw).with_context(|| {
-            format!(
-                "parsing {} failed (JSON/JSON5); refusing to overwrite potentially valid user settings",
+        Err(_) => {
+            let value = json5::from_str(raw).with_context(|| {
+                format!(
+                    "parsing {} failed (JSON/JSON5); refusing to overwrite potentially valid user settings",
+                    path.display()
+                )
+            })?;
+            // Writers re-serialize with serde_json, which strips the
+            // comments/relaxed syntax that forced the JSON5 fallback. Log it
+            // locally so the .headroom-backup is discoverable, but do NOT
+            // capture to Sentry: this is expected, benign behavior (user keeps
+            // comments in their settings), and the capture just inflated
+            // RUST-4R with 120+ no-action events. Local info only.
+            log::info!(
+                "{} contains JSON5 syntax (comments/trailing commas); a Headroom rewrite will normalize it to strict JSON — the original is kept as a .headroom-backup file",
                 path.display()
-            )
-        })?,
+            );
+            value
+        }
     };
     value
         .as_object()
@@ -3726,19 +3989,18 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        build_headroom_markitdown_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
-        build_headroom_rtk_hook, claude_code_user_state_exists,
-        claude_hook_present_in_value, remove_pre_tool_use_markers,
-        default_shell_targets_for_family, entry_contains_hook, find_on_path_entries,
-        normalize_setup_state, normalized_setup_id, nvm_binary_candidates, parse_json_object,
-        codex_home, codex_sqlite_store_expected, codex_store_version,
-        discover_codex_state_dbs, remove_managed_block,
-        retag_codex_thread_providers, retag_codex_threads_to_headroom, retag_one_codex_db,
-        is_permission_denied, oss_remnant_warnings, pin_codex_mcp_command, render_codex_config,
-        serialize_paths,
-        shell_block_contains_in_files,
-        shell_block_contains_text_in_files, shell_double_quote, strip_headroom_hook_from_settings,
-        upsert_managed_block, write_file_if_changed, ClientSetupState, ShellFamily,
+        build_claude_guard_script, build_codex_guard_script, build_headroom_markitdown_hook,
+        build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
+        claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
+        codex_sqlite_store_expected, default_shell_targets_for_family,
+        discover_codex_state_dbs, entry_contains_hook, find_on_path_entries, is_permission_denied,
+        normalize_setup_state, normalized_setup_id, nvm_binary_candidates, oss_remnant_warnings,
+        parse_json_object, pin_codex_mcp_command, remove_managed_block,
+        remove_pre_tool_use_markers, render_codex_config, retag_codex_thread_providers,
+        retag_codex_threads_to_headroom, retag_one_codex_db, serialize_paths,
+        shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
+        strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
+        ClientSetupState, ShellFamily,
     };
     use rusqlite::Connection;
 
@@ -3776,6 +4038,7 @@ mod tests {
                 ("codex".into(), vec!["/Users/test/.bash_profile".into()]),
                 ("claude_code".into(), vec!["/Users/test/.bashrc".into()]),
             ]),
+            preserved_base_urls: BTreeMap::new(),
             rtk_disabled: false,
         };
 
@@ -3922,8 +4185,8 @@ mod tests {
         )
         .expect("write settings");
 
-        let changed =
-            remove_pre_tool_use_markers(&settings, &["headroom-markitdown-read.sh"]).expect("strip");
+        let changed = remove_pre_tool_use_markers(&settings, &["headroom-markitdown-read.sh"])
+            .expect("strip");
         assert!(changed);
 
         let after: serde_json::Value =
@@ -4453,6 +4716,65 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
     }
 
     #[test]
+    fn hook_script_passes_through_check_commands() {
+        // `rtk git diff --check` swallows the whitespace report; the hook must
+        // leave any --check command unrewritten even when rtk would rewrite it.
+        let root = unique_temp_dir("headroom-hook-check");
+        fs::create_dir_all(&root).expect("create root");
+
+        let fake_rtk = root.join("fake-rtk");
+        fs::write(
+            &fake_rtk,
+            "#!/usr/bin/env bash\nshift\necho \"/bin/echo $*\"\n",
+        )
+        .expect("write fake rtk");
+        fs::set_permissions(
+            &fake_rtk,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod rtk");
+
+        let system_python = PathBuf::from("/usr/bin/python3");
+        let hook_body = build_headroom_rtk_hook(&fake_rtk, &system_python);
+        let hook_path = root.join("hook.sh");
+        fs::write(&hook_path, &hook_body).expect("write hook");
+        fs::set_permissions(
+            &hook_path,
+            <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .expect("chmod hook");
+
+        for cmd in ["git diff --cached --check", "git diff --check"] {
+            let stdin = format!(r#"{{"tool_input":{{"command":"{cmd}"}}}}"#);
+            let output = std::process::Command::new("bash")
+                .arg(&hook_path)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut child| {
+                    use std::io::Write;
+                    child
+                        .stdin
+                        .as_mut()
+                        .unwrap()
+                        .write_all(stdin.as_bytes())
+                        .unwrap();
+                    child.wait_with_output()
+                })
+                .expect("run hook");
+            assert!(output.status.success(), "hook should exit 0 for {cmd}");
+            assert!(
+                output.stdout.is_empty(),
+                "hook must not rewrite {cmd}, got: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn hook_script_emits_rewrite_when_first_token_is_valid_absolute_path() {
         let root = unique_temp_dir("headroom-hook-bash-ok");
         fs::create_dir_all(&root).expect("create root");
@@ -4666,10 +4988,18 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         prev_xdg: Option<std::ffi::OsString>,
         prev_shell: Option<std::ffi::OsString>,
         prev_codex: Option<std::ffi::OsString>,
+        // Held for the guard's lifetime: env vars are process-global, so two
+        // TestHome tests running on parallel threads corrupt each other's HOME
+        // (and can leak writes into the developer's real profile). serial_test
+        // only covers tests that opted in; this lock covers every TestHome user.
+        _env_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TestHome {
         fn new() -> Self {
+            let env_lock = crate::test_env_lock::HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let tmp = tempfile::tempdir().expect("create temp home");
             let home = tmp.path().to_path_buf();
             let prev_home = std::env::var_os("HOME");
@@ -4695,6 +5025,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 prev_xdg,
                 prev_shell,
                 prev_codex,
+                _env_lock: env_lock,
             }
         }
 
@@ -4845,7 +5176,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&script).unwrap().permissions().mode();
-            assert!(mode & 0o111 != 0, "guard script is executable, got {mode:o}");
+            assert!(
+                mode & 0o111 != 0,
+                "guard script is executable, got {mode:o}"
+            );
         }
 
         let settings_path = home.path().join(".claude").join("settings.json");
@@ -4865,7 +5199,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                         .any(|h| h["command"] == serde_json::Value::String(command.clone()))
                 })
                 .count();
-            assert_eq!(count, 1, "guard registered once for {event}, got:\n{settings:#}");
+            assert_eq!(
+                count, 1,
+                "guard registered once for {event}, got:\n{settings:#}"
+            );
         }
         assert_eq!(
             settings["hooks"]["SessionStart"][0]["matcher"],
@@ -4887,6 +5224,73 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
         // settings.json must NOT be deleted even if it were otherwise empty.
         assert!(settings_path.exists(), "settings.json preserved on disable");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_preserves_and_disable_restores_custom_base_url() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        fs::create_dir_all(home.path().join(".claude")).unwrap();
+        // A corporate gateway already routes Claude Code before Headroom.
+        let gateway = "https://gateway.corp.example/anthropic";
+        fs::write(
+            home.path().join(".claude").join("settings.json"),
+            format!(r#"{{"env":{{"ANTHROPIC_BASE_URL":"{gateway}"}}}}"#),
+        )
+        .unwrap();
+        seed_installed_rtk();
+
+        let result = super::apply_client_setup("claude_code").expect("apply");
+        // Setup captured the gateway and told the caller it took over routing.
+        assert_eq!(result.replaced_base_url.as_deref(), Some(gateway));
+        let settings_path = home.path().join(".claude").join("settings.json");
+        let after_apply = read_settings_json(&settings_path);
+        assert_eq!(
+            after_apply["env"]["ANTHROPIC_BASE_URL"],
+            serde_json::Value::String(super::HEADROOM_ANTHROPIC_BASE_URL.to_string())
+        );
+        assert_eq!(
+            super::load_setup_state().preserved_base_urls["claude_code"],
+            gateway
+        );
+
+        super::disable_client_setup("claude_code").expect("disable");
+        // The gateway URL is restored, not deleted.
+        let after_disable = read_settings_json(&settings_path);
+        assert_eq!(
+            after_disable["env"]["ANTHROPIC_BASE_URL"],
+            serde_json::Value::String(gateway.to_string()),
+            "custom base URL restored on disable, got:\n{after_disable:#}"
+        );
+        assert!(
+            !super::load_setup_state()
+                .preserved_base_urls
+                .contains_key("claude_code"),
+            "preserved entry consumed after restore"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_without_custom_base_url_does_not_report_takeover() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+
+        let result = super::apply_client_setup("claude_code").expect("apply");
+        assert!(result.replaced_base_url.is_none());
+        assert!(super::load_setup_state().preserved_base_urls.is_empty());
+
+        // Disable deletes the key (nothing to restore).
+        super::disable_client_setup("claude_code").expect("disable");
+        let settings_path = home.path().join(".claude").join("settings.json");
+        if settings_path.exists() {
+            let after = read_settings_json(&settings_path);
+            assert!(after["env"]["ANTHROPIC_BASE_URL"].is_null());
+        }
     }
 
     #[test]
@@ -4955,7 +5359,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             "RTK binary must be absent for this test"
         );
         let state = super::load_setup_state();
-        assert!(!state.rtk_disabled, "rtk_disabled stays false when untoggled");
+        assert!(
+            !state.rtk_disabled,
+            "rtk_disabled stays false when untoggled"
+        );
 
         let verification =
             super::verify_client_setup("claude_code").expect("verify_client_setup succeeds");
@@ -4999,7 +5406,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         let agents = home.path().join(".codex").join("AGENTS.md");
         let body = fs::read_to_string(&agents).expect("AGENTS.md written");
-        assert!(body.contains("Headroom RTK"), "nudge heading present: {body}");
+        assert!(
+            body.contains("Headroom RTK"),
+            "nudge heading present: {body}"
+        );
         assert!(
             body.contains(&rtk.display().to_string()),
             "nudge references the managed rtk path: {body}"
@@ -5134,6 +5544,38 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
+    fn clear_client_setups_twice_preserves_remembered_snapshot() {
+        // Regression: pause (first clear) moves configured -> remembered; the
+        // quit-time second clear used to wipe remembered_clients because the
+        // re-save was skipped while configured was empty — so a pause
+        // followed by Cmd-Q permanently lost every connector.
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
+        seed_installed_rtk();
+
+        super::apply_client_setup("claude_code").expect("apply");
+
+        super::clear_client_setups().expect("first clear (pause)");
+        let state = super::load_setup_state();
+        assert!(state.configured_clients.is_empty());
+        assert!(
+            state.remembered_clients.contains_key("claude_code"),
+            "pause snapshots the configured client, got: {:?}",
+            state.remembered_clients
+        );
+
+        super::clear_client_setups().expect("second clear (quit)");
+        let state = super::load_setup_state();
+        assert!(
+            state.remembered_clients.contains_key("claude_code"),
+            "quit-time clear after a pause must keep the restore snapshot, got: {:?}",
+            state.remembered_clients
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn apply_then_verify_then_disable_codex_round_trip() {
         let home = TestHome::new();
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
@@ -5254,7 +5696,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = fs::metadata(&script).unwrap().permissions().mode();
-            assert!(mode & 0o111 != 0, "guard script is executable, got {mode:o}");
+            assert!(
+                mode & 0o111 != 0,
+                "guard script is executable, got {mode:o}"
+            );
         }
 
         let hooks: serde_json::Value =
@@ -5275,7 +5720,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
             assert!(registered, "guard registered for {event}, got:\n{hooks:#}");
         }
         // SessionStart carries the lifecycle matcher; UserPromptSubmit does not.
-        assert_eq!(hooks["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact");
+        assert_eq!(
+            hooks["hooks"]["SessionStart"][0]["matcher"],
+            "startup|resume|clear|compact"
+        );
     }
 
     #[test]
@@ -5310,7 +5758,10 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
                 })
             })
             .count();
-        assert_eq!(guard_count, 1, "guard registered exactly once, got:\n{hooks:#}");
+        assert_eq!(
+            guard_count, 1,
+            "guard registered exactly once, got:\n{hooks:#}"
+        );
 
         super::disable_client_setup("codex").expect("disable");
 
@@ -5329,6 +5780,40 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert!(
             after_str.contains("echo mine"),
             "user-authored hook preserved, got:\n{after:#}"
+        );
+    }
+
+    #[test]
+    fn remove_guard_hook_entries_strips_stale_interpreter_and_argv_forms() {
+        // Regression: an entry written by another build (different interpreter) or
+        // normalized by Codex into argv-array form under an unregistered event must
+        // still be stripped -- otherwise deleting the script leaves a dangling hook.
+        let home = TestHome::new();
+        let hooks_path = home.path().join("hooks.json");
+        let script = "/Users/x/.codex/hooks/headroom-codex-guard.py";
+        fs::write(
+            &hooks_path,
+            format!(
+                r#"{{"hooks":{{
+                    "SessionStart":[{{"hooks":[{{"type":"command","command":"/opt/homebrew/bin/python3 {script}"}}]}}],
+                    "SessionEnd":[{{"hooks":[{{"type":"command","command":["python3","{script}"]}}]}}],
+                    "UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"echo mine"}}]}}]
+                }}}}"#
+            ),
+        )
+        .unwrap();
+
+        super::remove_guard_hook_entries(&hooks_path, script, true).unwrap();
+
+        let after = read_settings_json(&hooks_path);
+        let after_str = serde_json::to_string(&after).unwrap();
+        assert!(
+            !after_str.contains("headroom-codex-guard.py"),
+            "stale guard forms stripped, got:\n{after:#}"
+        );
+        assert!(
+            after_str.contains("echo mine"),
+            "user hook preserved, got:\n{after:#}"
         );
     }
 
@@ -5588,18 +6073,45 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let path = super::setup_state_path();
         assert!(path.exists(), "setup state file written");
 
-        // The sibling .tmp file must not be left behind after a successful
-        // publish — its presence would mean the rename step never happened.
-        let tmp = {
-            let mut s = path.clone().into_os_string();
-            s.push(".tmp");
-            std::path::PathBuf::from(s)
-        };
-        assert!(!tmp.exists(), "tmp file cleaned up by rename, got: {tmp:?}");
+        // No sibling .tmp* file may be left behind after a successful publish —
+        // its presence would mean the rename step never happened.
+        let dir = path.parent().unwrap();
+        let stem = path.file_name().unwrap().to_string_lossy().into_owned();
+        let leftover: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(&format!("{stem}.tmp")))
+            .collect();
+        assert!(leftover.is_empty(), "tmp files cleaned up by rename, got: {leftover:?}");
 
         // Round-trip survives.
         let reloaded = super::load_setup_state();
         assert!(reloaded.configured_clients.contains_key("claude_code"));
+    }
+
+    #[test]
+    fn atomic_write_concurrent_same_path_no_enoent() {
+        // Regression for Sentry RUST-3W / RUST-4W: a shared `<path>.tmp` made
+        // concurrent writers race — one rename consumed the tmp, the other hit
+        // ENOENT. Unique per-writer tmp names must let all writers succeed.
+        let dir = std::env::temp_dir().join(format!("aw_race_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let p = path.clone();
+                std::thread::spawn(move || {
+                    let body = format!("{{\"n\":{i}}}");
+                    super::atomic_write(&p, body.as_bytes())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("concurrent atomic_write must not ENOENT");
+        }
+        assert!(path.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -5660,7 +6172,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         );
 
         let moved = retag_one_codex_db(&db, "openai", "headroom").unwrap();
-        assert_eq!(moved, 2);
+        assert_eq!(moved, Some(2));
         assert_eq!(provider_count(&db, "openai"), 0);
         assert_eq!(provider_count(&db, "headroom"), 3);
         // Third-party providers are untouched.
@@ -5668,7 +6180,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
         // Reverse direction round-trips only the headroom rows.
         let back = retag_one_codex_db(&db, "headroom", "openai").unwrap();
-        assert_eq!(back, 3);
+        assert_eq!(back, Some(3));
         assert_eq!(provider_count(&db, "headroom"), 0);
         assert_eq!(provider_count(&db, "openai"), 3);
         assert_eq!(provider_count(&db, "anthropic"), 1);
@@ -5680,7 +6192,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         let db = tmp.path().join("state_5.sqlite");
         // Open creates an empty DB with no `threads` table.
         Connection::open(&db).unwrap();
-        assert_eq!(retag_one_codex_db(&db, "openai", "headroom").unwrap(), 0);
+        assert_eq!(retag_one_codex_db(&db, "openai", "headroom").unwrap(), None);
     }
 
     #[test]
@@ -5738,16 +6250,6 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(provider_count(&db, "openai"), 0);
         // Third-party threads are untouched.
         assert_eq!(provider_count(&db, "anthropic"), 1);
-    }
-
-    #[test]
-    fn codex_store_version_parses_state_filename() {
-        assert_eq!(codex_store_version(Path::new("/x/state_5.sqlite")), Some(5));
-        assert_eq!(codex_store_version(Path::new("/x/state_42.sqlite")), Some(42));
-        assert_eq!(codex_store_version(Path::new("/x/config.toml")), None);
-        assert_eq!(codex_store_version(Path::new("/x/state_.sqlite")), None);
-        assert_eq!(codex_store_version(Path::new("/x/state_x.sqlite")), None);
-        assert_eq!(codex_store_version(Path::new("/x/state_5.db")), None);
     }
 
     #[test]
@@ -5809,21 +6311,98 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
 
     #[test]
     #[serial_test::serial]
-    fn discover_codex_state_dbs_finds_versioned_stores() {
+    fn pin_codex_mcp_command_normalizes_python_module_args() {
+        // Upstream may register `<python> -m headroom.cli mcp serve`. Pinning
+        // command to the console script must also rewrite the args, otherwise
+        // `headroom -m headroom.cli ...` fails with "No such option '-m'".
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.headroom]\n\
+             command = \"/somewhere/venv/bin/python3\"\n\
+             args = [\"-m\", \"headroom.cli\", \"mcp\", \"serve\"]\n\
+             \n\
+             [mcp_servers.headroom.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n",
+        )
+        .unwrap();
+
+        let entrypoint = home.path().join("venv/bin/headroom");
+        assert!(pin_codex_mcp_command(&entrypoint).unwrap().is_some());
+
+        let after = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            after.contains("args = [\"mcp\", \"serve\"]"),
+            "python -m args must be normalized, got:\n{after}"
+        );
+        assert!(!after.contains("-m"), "no -m leftovers, got:\n{after}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pin_codex_mcp_command_handles_multi_line_args_array() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let config = codex.join("config.toml");
+        std::fs::write(
+            &config,
+            "[mcp_servers.headroom]\n\
+             command = \"/somewhere/venv/bin/python3\"\n\
+             args = [\n  \"-m\",\n  \"headroom.cli\",\n  \"mcp\",\n  \"serve\",\n]\n\
+             \n\
+             [mcp_servers.headroom.env]\n\
+             HEADROOM_PROXY_URL = \"http://127.0.0.1:6767\"\n",
+        )
+        .unwrap();
+
+        let entrypoint = home.path().join("venv/bin/headroom");
+        assert!(pin_codex_mcp_command(&entrypoint).unwrap().is_some());
+
+        let after = std::fs::read_to_string(&config).unwrap();
+        // No orphaned continuation lines — the rebuilt file must parse.
+        let parsed: toml::Value = toml::from_str(&after).expect("rebuilt config parses");
+        assert_eq!(
+            parsed["mcp_servers"]["headroom"]["args"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(after.contains("[mcp_servers.headroom.env]"));
+        assert!(!after.contains("headroom.cli"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn discover_codex_state_dbs_finds_any_sqlite_regardless_of_name() {
         let home = TestHome::new();
         let codex = home.path().join(".codex");
         std::fs::create_dir_all(codex.join("sqlite")).unwrap();
-        // GUI store under sqlite/, CLI store at the root, on different versions.
+        // GUI store under sqlite/, CLI store at the root, plus a renamed store
+        // whose name no longer follows the `state_<N>` scheme -- discovery is
+        // content-based now, so it must still be picked up (the actual fix).
         std::fs::File::create(codex.join("sqlite").join("state_6.sqlite")).unwrap();
         std::fs::File::create(codex.join("state_5.sqlite")).unwrap();
-        // A non-store file in the same dir must be ignored.
+        std::fs::File::create(codex.join("sqlite").join("threads.sqlite")).unwrap();
+        // A non-sqlite file in the same dir must be ignored.
         std::fs::File::create(codex.join("config.toml")).unwrap();
 
-        let versions: BTreeSet<u32> = discover_codex_state_dbs()
+        let names: BTreeSet<String> = discover_codex_state_dbs()
             .into_iter()
-            .map(|(_, v)| v)
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_owned())
             .collect();
-        assert_eq!(versions, BTreeSet::from([5, 6]));
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "state_6.sqlite".to_owned(),
+                "state_5.sqlite".to_owned(),
+                "threads.sqlite".to_owned(),
+            ])
+        );
     }
 
     #[test]
@@ -5841,5 +6420,52 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6767
         assert_eq!(provider_count(&db, "headroom"), 2);
         assert_eq!(provider_count(&db, "openai"), 0);
         assert_eq!(provider_count(&db, "anthropic"), 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn retag_handles_store_renamed_off_state_scheme() {
+        // The regression this change fixes: Codex renames the store off the
+        // `state_<N>.sqlite` scheme entirely. Content-based discovery must still
+        // find and retag it by its `threads` table, not the filename.
+        let home = TestHome::new();
+        let db = home.path().join(".codex").join("sqlite").join("threads.sqlite");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
+
+        retag_codex_threads_to_headroom();
+
+        assert_eq!(provider_count(&db, "headroom"), 2);
+        assert_eq!(provider_count(&db, "openai"), 0);
+        assert_eq!(provider_count(&db, "anthropic"), 1);
+    }
+
+    #[test]
+    fn claude_guard_script_is_diagnostic_and_reachable_tolerates_any_response() {
+        let script = build_claude_guard_script();
+        // reachable() no longer flags a 503-during-bypass as "app down".
+        assert!(!script.contains("return response.status < 500"));
+        assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
+        // main() explains WHY instead of the flat "is not" message.
+        assert!(script.contains("def diagnose_route"));
+        assert!(script.contains("did not inherit the Headroom shell env"));
+        assert!(script.contains("overrides Headroom's route"));
+        assert!(!script.contains("ANTHROPIC_BASE_URL is not \" + BASE_URL"));
+        // Notifications are debounced and reachability retries once, so an app
+        // relaunch doesn't produce a notification storm.
+        assert!(script.contains("DEBOUNCE_PATH.touch()"));
+        assert!(script.contains("time.sleep(2)\n    return probe()"));
+    }
+
+    #[test]
+    fn codex_guard_script_names_actual_values_and_tolerates_any_response() {
+        let script = build_codex_guard_script();
+        assert!(!script.contains("return response.status < 500"));
+        assert!(script.contains("except urllib.error.HTTPError:\n        return True"));
+        // Messages include the actual found value, not just "is not headroom".
+        assert!(script.contains("(expected \"headroom\")"));
+        assert!(script.contains("(expected \" + BASE_URL + \")"));
+        assert!(script.contains("DEBOUNCE_PATH.touch()"));
+        assert!(script.contains("time.sleep(2)\n    return probe()"));
     }
 }

@@ -1,7 +1,9 @@
 // Debug builds store secrets in plain files under the app data dir so that the
 // keychain is never touched and macOS never shows an access prompt during development.
-// Release builds use the macOS Data Protection Keychain (requires the keychain-access-groups
-// entitlement present in Entitlements.plist).
+// Release builds use the legacy login keychain via the Security framework with
+// default ACL/accessibility (kSecClass/kSecAttrService/kSecAttrAccount only —
+// no kSecUseDataProtectionKeychain, which would additionally require the
+// keychain-access-groups entitlement that Entitlements.plist does not carry).
 
 // ── Debug: file-based store ──────────────────────────────────────────────────
 
@@ -47,7 +49,7 @@ mod platform {
     }
 }
 
-// ── Release / macOS: Data Protection Keychain ────────────────────────────────
+// ── Release / macOS: login keychain (Security framework) ────────────────────
 
 #[cfg(all(not(debug_assertions), target_os = "macos"))]
 mod platform {
@@ -198,6 +200,15 @@ mod platform {
     }
 
     pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {
+        write_secret_inner(service, account, secret, true)
+    }
+
+    fn write_secret_inner(
+        service: &str,
+        account: &str,
+        secret: &str,
+        allow_retry: bool,
+    ) -> Result<(), String> {
         unsafe {
             let query = base_query(service, account);
             let data = CFDataCreate(std::ptr::null(), secret.as_ptr(), secret.len() as CFIndex);
@@ -241,10 +252,20 @@ mod platform {
             if add_status == ERR_SEC_DUPLICATE_ITEM {
                 // Update missed it (inaccessible/ghost item, e.g. created by a
                 // prior app signature) but Add sees the primary-key collision.
-                // Drop the stale item and re-add once. ponytail: single retry --
-                // a duplicate can't recur after a successful delete.
-                let _ = delete_secret(service, account);
-                return write_secret(service, account, secret);
+                // Drop the stale item and re-add ONCE: delete_secret maps
+                // not-found to Ok, so a truly undeletable ghost (iCloud sync
+                // residue, cross-signature ACL) would loop Update->notFound,
+                // Add->duplicate, Delete->notFound forever if we recursed
+                // unboundedly.
+                if allow_retry {
+                    let _ = delete_secret(service, account);
+                    return write_secret_inner(service, account, secret, false);
+                }
+                return Err(
+                    "write keychain secret failed: duplicate item persists after delete \
+                     (inaccessible keychain entry from another app signature?)"
+                        .to_string(),
+                );
             }
             check_status(add_status, "write keychain secret")
         }
@@ -264,12 +285,23 @@ mod platform {
 
     fn check_status(status: OSStatus, action: &str) -> Result<(), String> {
         if status == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "{action} failed with macOS Security status {status}."
-            ))
+            return Ok(());
         }
+        // The common failure codes on managed (MDM) or locked-down machines
+        // get a hint the user can act on — a bare "status -25308" was the
+        // whole error message people saw at sign-in.
+        let hint = match status {
+            // errSecInteractionNotAllowed: keychain locked or UI not allowed.
+            -25308 => " Your macOS keychain appears to be locked — unlock it in Keychain Access (or log out and back in) and retry.",
+            // errSecAuthFailed
+            -25293 => " macOS denied keychain access for Headroom. If this Mac is company-managed, your MDM profile may restrict keychain use.",
+            // errSecMissingEntitlement
+            -34018 => " The app build is missing a keychain entitlement — reinstalling Headroom usually fixes this.",
+            _ => "",
+        };
+        Err(format!(
+            "{action} failed with macOS Security status {status}.{hint}"
+        ))
     }
 }
 
