@@ -7,6 +7,7 @@ import { ThrashingPanel } from "./ThrashingPanel";
 import { RoutingPanel } from "./RoutingPanel";
 import { PruningPanel } from "./PruningPanel";
 import { MemoryPanel } from "./MemoryPanel";
+import { ImagingPanel } from "./ImagingPanel";
 
 interface TabDef {
   id: string;
@@ -23,7 +24,8 @@ const TABS: TabDef[] = [
   { id: "routing", label: "Routing", capability: "routing.config.v1", blurb: "Route each request to the cheapest capable model." },
   { id: "pruning", label: "Pruning", capability: "pruning.config.v1", blurb: "Question-aware context pruning." },
   { id: "thrashing", label: "Thrashing", capability: "token_stats.v1", blurb: "Detect re-reads of compacted content." },
-  { id: "memory", label: "Memory", capability: "ccr.browse.v1", blurb: "Browse the CCR store of paged-out content." }
+  { id: "memory", label: "Memory", capability: "ccr.browse.v1", blurb: "Browse the CCR store of paged-out content." },
+  { id: "imaging", label: "Imaging", capability: "imaging.local.v1", blurb: "Render bulky context as dense images to cut input tokens (pxpipe)." }
 ];
 
 export function TokenReductionView() {
@@ -81,11 +83,13 @@ export function TokenReductionView() {
             configApplies={has("pruning.config.v1")}
             telemetryAvailable={has("pruning.stats.v1")}
           />
-        ) : (
+        ) : active.id === "memory" ? (
           <MemoryPanel
             configApplies={has("ccr.config.v1")}
             browseAvailable={has("ccr.browse.v1")}
           />
+        ) : (
+          <ImagingPanel available={has("imaging.local.v1")} />
         )}
       </div>
     </section>

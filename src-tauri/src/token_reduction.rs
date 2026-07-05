@@ -86,6 +86,33 @@ fn imaging_enabled_from_value(cfg: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Persist `imaging.enabled` into the config, preserving every other key.
+pub fn set_imaging_enabled(enabled: bool) -> Result<(), String> {
+    let path = config_path();
+    let updated = with_imaging_enabled(read_config_at(&path)?, enabled);
+    write_config_at(&path, &updated)
+}
+
+/// Pure read-modify-write: set `imaging.enabled` on `cfg` without disturbing
+/// sibling sections. Coerces a non-object root/section to an object.
+fn with_imaging_enabled(mut cfg: Value, enabled: bool) -> Value {
+    if !cfg.is_object() {
+        cfg = Value::Object(serde_json::Map::new());
+    }
+    let root = cfg.as_object_mut().expect("object");
+    let imaging = root
+        .entry("imaging")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !imaging.is_object() {
+        *imaging = Value::Object(serde_json::Map::new());
+    }
+    imaging
+        .as_object_mut()
+        .expect("object")
+        .insert("enabled".to_string(), Value::Bool(enabled));
+    cfg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +162,22 @@ mod tests {
     fn local_capabilities_gated_on_node() {
         assert_eq!(local_capabilities(true), vec!["imaging.local.v1".to_string()]);
         assert!(local_capabilities(false).is_empty());
+    }
+
+    #[test]
+    fn with_imaging_enabled_preserves_siblings() {
+        let base = serde_json::json!({ "cache": { "enabled": true }, "imaging": { "enabled": false } });
+        let on = with_imaging_enabled(base, true);
+        assert!(imaging_enabled_from_value(&on));
+        // Sibling section untouched.
+        assert_eq!(on["cache"]["enabled"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn with_imaging_enabled_creates_section_from_empty() {
+        let on = with_imaging_enabled(serde_json::json!({}), true);
+        assert!(imaging_enabled_from_value(&on));
+        let off = with_imaging_enabled(on, false);
+        assert!(!imaging_enabled_from_value(&off));
     }
 }

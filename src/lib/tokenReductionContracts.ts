@@ -51,3 +51,12 @@ export interface TokenReductionConfig {
     enabled?: boolean;
   };
 }
+
+// Status of the pxpipe imaging sidecar (from the `pxpipe_status` /
+// `set_imaging_enabled` Tauri commands).
+export interface PxpipeStatus {
+  running: boolean;
+  healthy: boolean;
+  port: number;
+  nodeAvailable: boolean;
+}

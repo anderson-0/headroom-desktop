@@ -940,6 +940,24 @@ fn start_bootstrap(app: AppHandle) -> Result<(), String> {
         // the one-time scan does not block the UI.
         state.tool_manager.seed_verbosity_baseline_if_needed();
 
+        // pxpipe imaging (plan 06): if enabled in config, bring the sidecar up and
+        // wait for health BEFORE headroom spawns, so headroom's upstream env
+        // (backend_upstream_env) points at a live sidecar. Opt-in, so this only
+        // adds boot latency for imaging users; a failed/slow sidecar just leaves
+        // imaging inactive this boot (traffic falls back to Anthropic direct).
+        if token_reduction::read_imaging_enabled() {
+            let pxpipe_state = app_handle.state::<pxpipe::PxpipeState>();
+            match pxpipe::start(&pxpipe_state) {
+                Ok(port) if pxpipe::wait_healthy(port, std::time::Duration::from_secs(40)) => {
+                    log::info!("pxpipe: sidecar healthy on {port} before headroom start");
+                }
+                Ok(port) => log::warn!(
+                    "pxpipe: sidecar on {port} not healthy within timeout; imaging inactive this boot"
+                ),
+                Err(err) => log::warn!("pxpipe: sidecar start failed at boot: {err}"),
+            }
+        }
+
         let ensure_result = state.ensure_headroom_running();
         state.set_runtime_starting(true);
 
@@ -3118,6 +3136,38 @@ async fn force_restart_headroom(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Enable/disable pxpipe imaging (plan 06 phase 4). Orchestrates the whole flow:
+/// persist the config gate, bring the sidecar up (or down), and restart headroom
+/// so its upstream env (ANTHROPIC_TARGET_API_URL) is re-read. Restart-to-apply is
+/// intentional for v1 — the toggle is not hot-path. Returns the sidecar status.
+#[tauri::command]
+fn set_imaging_enabled(
+    app: AppHandle,
+    pxpipe_state: State<'_, pxpipe::PxpipeState>,
+    enabled: bool,
+) -> Result<pxpipe::PxpipeStatus, String> {
+    let state: State<'_, AppState> = app.state();
+    if enabled {
+        let port = pxpipe::start(&pxpipe_state)?;
+        if !pxpipe::wait_healthy(port, std::time::Duration::from_secs(40)) {
+            pxpipe::stop(&pxpipe_state);
+            return Err("pxpipe sidecar did not become healthy; imaging not enabled.".to_string());
+        }
+        // Persist only once the sidecar is actually up, so a failed start never
+        // leaves the gate on with a dead upstream.
+        token_reduction::set_imaging_enabled(true)?;
+        state.stop_headroom();
+        state.resume_runtime().map_err(|err| err.to_string())?;
+    } else {
+        token_reduction::set_imaging_enabled(false)?;
+        // Restart headroom first (drops the upstream env), then stop the sidecar.
+        state.stop_headroom();
+        state.resume_runtime().map_err(|err| err.to_string())?;
+        pxpipe::stop(&pxpipe_state);
+    }
+    Ok(pxpipe::status(&pxpipe_state))
+}
+
 #[tauri::command]
 fn hide_launcher_animated(app: AppHandle) {
     // The launcher close animation now lives in the webview/CSS layer.
@@ -3498,6 +3548,7 @@ pub fn run() {
             pxpipe::pxpipe_start,
             pxpipe::pxpipe_stop,
             pxpipe::pxpipe_status,
+            set_imaging_enabled,
             get_dashboard_state,
             get_app_update_configuration,
             check_for_app_update,

@@ -203,16 +203,34 @@ pub fn pxpipe_stop(state: State<'_, PxpipeState>) {
     stop(&state);
 }
 
-#[tauri::command]
-pub fn pxpipe_status(state: State<'_, PxpipeState>) -> PxpipeStatus {
+/// Poll until the sidecar answers on `port`, or `timeout` elapses.
+pub fn wait_healthy(port: u16, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if sidecar_healthy(port) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+pub fn status(state: &PxpipeState) -> PxpipeStatus {
     let running = state.0.lock().map(|g| g.is_some()).unwrap_or(false);
     let port = pxpipe_port::get();
     PxpipeStatus {
         running,
         healthy: running && sidecar_healthy(port),
         port,
-        node_available: locate_npx().is_some(),
+        node_available: node_available(),
     }
+}
+
+#[tauri::command]
+pub fn pxpipe_status(state: State<'_, PxpipeState>) -> PxpipeStatus {
+    status(&state)
 }
 
 #[cfg(test)]
