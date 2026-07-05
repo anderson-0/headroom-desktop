@@ -13,6 +13,8 @@ mod models;
 mod port_conflict;
 mod pricing;
 mod proxy_intercept;
+mod pxpipe;
+mod pxpipe_port;
 mod state;
 mod storage;
 mod token_reduction;
@@ -3487,11 +3489,15 @@ pub fn run() {
         .on_window_event(|window, event| handle_window_event(window, event))
         .manage(state)
         .manage(PendingAppUpdate(Mutex::new(None)))
+        .manage(pxpipe::PxpipeState::default())
         .invoke_handler(tauri::generate_handler![
             token_reduction::get_token_reduction_config,
             token_reduction::set_token_reduction_config,
             token_reduction::get_token_reduction_capabilities,
             token_reduction::get_cache_stats,
+            pxpipe::pxpipe_start,
+            pxpipe::pxpipe_stop,
+            pxpipe::pxpipe_status,
             get_dashboard_state,
             get_app_update_configuration,
             check_for_app_update,
@@ -3574,6 +3580,10 @@ pub fn run() {
             ) {
                 let state: tauri::State<'_, AppState> = app.state();
                 state.stop_headroom();
+                // Stop the optional pxpipe sidecar too, so it doesn't outlive the
+                // desktop. No-op when it was never started.
+                let pxpipe_state: tauri::State<'_, pxpipe::PxpipeState> = app.state();
+                pxpipe::stop(&pxpipe_state);
                 // Gracefully reverse every client's base-URL override (and shell
                 // blocks) on quit so Claude Code / Codex fall back to talking
                 // directly to their native providers while Headroom is not
