@@ -2264,9 +2264,31 @@ async fn get_claude_code_projects(
         .map_err(|err| err.to_string())
 }
 
+/// Run a blocking closure on the blocking pool. Async commands must NOT call
+/// `reqwest::blocking` (or anything that builds a blocking client) directly: that
+/// client owns an internal tokio runtime, and dropping it on an async worker
+/// thread panics ("Cannot drop a runtime in a context where blocking is not
+/// allowed"). That panic unwinds the command future, so the frontend `invoke`
+/// never resolves and hangs forever (observed as the launch loader stuck at
+/// "Preparing Headroom runtime…"). `spawn_blocking` runs+drops the client on the
+/// blocking pool where blocking is allowed. Mirrors `get_runtime_status`.
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|err| err.to_string())?
+}
+
 #[tauri::command]
-async fn get_claude_usage(state: State<'_, AppState>) -> Result<ClaudeUsage, String> {
-    pricing::fetch_claude_usage(&state)
+async fn get_claude_usage(app: AppHandle) -> Result<ClaudeUsage, String> {
+    run_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        pricing::fetch_claude_usage(&state)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -2275,19 +2297,24 @@ fn get_claude_profile(state: State<'_, AppState>) -> ClaudeAccountProfile {
 }
 
 #[tauri::command]
-async fn get_headroom_pricing_status(
-    state: State<'_, AppState>,
-) -> Result<HeadroomPricingStatus, String> {
-    let status = pricing::get_pricing_status(&state)?;
-    // Reconcile the runtime with the freshly evaluated status. Bridges the
-    // gap between "user just upgraded" (subscription_active flips on) and
-    // "Headroom optimization actually resumes" — without this, the pricing
-    // gate's bypass flag would stay set and Python would stay down until
-    // the next app launch.
-    state.apply_pricing_gate_status(&status, crate::client_adapters::is_codex_enabled());
-    state.apply_codex_pricing_gate_status(status.codex.as_ref());
-    state.report_weekly_limit_transitions(&status);
-    Ok(status)
+async fn get_headroom_pricing_status(app: AppHandle) -> Result<HeadroomPricingStatus, String> {
+    // Offloaded to the blocking pool: get_pricing_status does blocking HTTP to the
+    // account API, and running it on the async worker panics on client drop and
+    // hangs this invoke (the launch loader freeze). See run_blocking.
+    run_blocking(move || {
+        let state: State<'_, AppState> = app.state();
+        let status = pricing::get_pricing_status(&state)?;
+        // Reconcile the runtime with the freshly evaluated status. Bridges the
+        // gap between "user just upgraded" (subscription_active flips on) and
+        // "Headroom optimization actually resumes" — without this, the pricing
+        // gate's bypass flag would stay set and Python would stay down until
+        // the next app launch.
+        state.apply_pricing_gate_status(&status, crate::client_adapters::is_codex_enabled());
+        state.apply_codex_pricing_gate_status(status.codex.as_ref());
+        state.report_weekly_limit_transitions(&status);
+        Ok(status)
+    })
+    .await
 }
 
 #[tauri::command]
